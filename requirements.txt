@@ -7,3 +7,4 @@ aiohttp
 fake-useragent
 jinja2
 urllib3
+paramiko

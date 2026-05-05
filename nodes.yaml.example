@@ -1,0 +1,61 @@
+# BotStrike — Fleet Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+# Copy this file to nodes.yaml and fill in your VPS details.
+# nodes.yaml is gitignored — it must NEVER be committed.
+#
+# SECURE SETUP (one-time, on your local machine):
+#
+#   1. Generate a dedicated key pair for BotStrike nodes:
+#        ssh-keygen -t ed25519 -C "botstrike-fleet" -f ~/.ssh/botstrike_key
+#
+#   2. Copy the public key to each VPS:
+#        ssh-copy-id -i ~/.ssh/botstrike_key.pub root@<vps-ip>
+#
+#   3. Fill in this file with each VPS IP, user, and key path.
+#
+#   4. Bootstrap all nodes (upload BotStrike + install deps):
+#        python botstrike.py --setup-nodes
+#
+#   5. Run a distributed test:
+#        python botstrike.py --url https://target.com --mode scrape --distributed
+#
+# ──────────────────────────────────────────────────────────────────────────────
+# REQUIREMENTS ON EACH VPS:
+#   - Debian / Ubuntu / Kali Linux
+#   - Python 3.9 or newer  (sudo apt install python3 python3-pip)
+#   - Outbound internet access to the target
+#   - SSH accessible from your local IP on the configured port
+#
+# WHAT HAPPENS DURING A RUN:
+#   1. BotStrike connects to all nodes simultaneously via SSH
+#   2. Uploads itself to ~/botstrike/ on each node via SFTP
+#   3. Runs pip install -r requirements.txt on each node
+#   4. Executes python3 botstrike.py ... on each node in parallel
+#   5. Streams stdout from all nodes back in real-time (live dashboard)
+#   6. Downloads JSON + HTML reports from each node via SFTP
+#   7. Merges all results into reports/distributed_<timestamp>/merged_report.json
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
+nodes:
+
+  - id: node-sg-01           # Friendly label — shown in reports and live dashboard
+    host: 1.2.3.4            # VPS public IP address or FQDN
+    user: root               # SSH user (root or any user with Python + pip access)
+    key: ~/.ssh/botstrike_key  # Path to private key on YOUR local machine
+    port: 22                 # SSH port (optional — defaults to 22)
+
+  - id: node-fr-01
+    host: 5.6.7.8
+    user: ubuntu
+    key: ~/.ssh/botstrike_key
+    # port: 22               # omit to use default
+
+  - id: node-us-east-01
+    host: 9.10.11.12
+    user: kali
+    key: ~/.ssh/botstrike_key
+
+# Add as many nodes as needed.
+# All nodes run simultaneously — each sends traffic from its own IP.
+# This bypasses per-IP rate limiting and gives you a realistic distributed picture.

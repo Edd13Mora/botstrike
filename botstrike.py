@@ -395,6 +395,44 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    # ── Distributed mode ─────────────────────────────────────────────────────
+    g_dist = p.add_argument_group(
+        "distributed mode  (multi-VPS fleet execution)",
+        description=(
+            "Run BotStrike simultaneously across a fleet of Linux VPS nodes.\n"
+            "Each node sends traffic from its own IP, bypassing per-IP rate limits.\n"
+            "All results are merged into a unified fleet report locally."
+        ),
+    )
+    g_dist.add_argument(
+        "--distributed",
+        action="store_true",
+        help=(
+            "Enable distributed execution. Requires --nodes (or nodes.yaml in cwd).\n"
+            "All nodes in the fleet run simultaneously against the same --url.\n"
+            "Auth key only — configure node IPs and keys in nodes.yaml."
+        ),
+    )
+    g_dist.add_argument(
+        "--nodes",
+        default="nodes.yaml",
+        metavar="FILE",
+        help=(
+            "Path to fleet config YAML.  Default: nodes.yaml\n"
+            "See nodes.yaml.example for format and setup instructions."
+        ),
+    )
+    g_dist.add_argument(
+        "--setup-nodes",
+        action="store_true",
+        dest="setup_nodes",
+        help=(
+            "Bootstrap all nodes in --nodes, then exit.\n"
+            "Uploads BotStrike, installs Python deps, runs a smoke test.\n"
+            "Run this once before your first --distributed engagement."
+        ),
+    )
+
     return p.parse_args()
 
 
@@ -587,8 +625,12 @@ def main() -> None:
     args = parse_args()
 
     # ── URL validation ──
-    if not getattr(args, "compare", False) and not args.url:
-        console.print("[red][!] --url is required (or use --compare with --url-a and --url-b)[/red]")
+    needs_url = (
+        not getattr(args, "setup_nodes", False)
+        and not getattr(args, "compare", False)
+    )
+    if needs_url and not args.url:
+        console.print("[red][!] --url is required (or use --compare / --setup-nodes)[/red]")
         sys.exit(1)
 
     # ── Proxy setup ──
@@ -613,6 +655,18 @@ def main() -> None:
 
     file_cfg = load_config(args.config)
     cfg = merge_cfg(file_cfg, args)
+
+    # ── Setup-nodes (no target needed) ──
+    if getattr(args, "setup_nodes", False):
+        from modules.distributor import cmd_setup_nodes
+        cmd_setup_nodes(getattr(args, "nodes", "nodes.yaml") or "nodes.yaml")
+        return
+
+    # ── Distributed mode ──
+    if getattr(args, "distributed", False):
+        from modules.distributor import run_distributed
+        run_distributed(args.url, args, cfg)
+        return
 
     # ── Compare mode ──
     if getattr(args, "compare", False):

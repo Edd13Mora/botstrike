@@ -26,6 +26,20 @@ BotStrike is a modular, command-line tool built for security consultants running
 - [Recommendations Engine](#recommendations-engine)
 - [Reporting](#reporting)
 - [Compare Mode](#compare-mode)
+- [Distributed Mode](#distributed-mode)
+  - [How Distributed Mode Works](#how-distributed-mode-works)
+  - [Prerequisites](#prerequisites)
+  - [Step 1 — Generate a Dedicated SSH Key](#step-1--generate-a-dedicated-ssh-key)
+  - [Step 2 — Authorize the Key on Every VPS](#step-2--authorize-the-key-on-every-vps)
+  - [Step 3 — Create nodes.yaml](#step-3--create-nodesyaml)
+  - [Step 4 — Bootstrap the Fleet](#step-4--bootstrap-the-fleet)
+  - [Step 5 — Run a Distributed Test](#step-5--run-a-distributed-test)
+  - [Live Fleet Dashboard](#live-fleet-dashboard)
+  - [Distributed Output Structure](#distributed-output-structure)
+  - [Merged Report Format](#merged-report-format)
+  - [Distributed CLI Reference](#distributed-cli-reference)
+  - [Security Model](#security-model)
+  - [Troubleshooting](#troubleshooting)
 - [Proxy Support](#proxy-support)
 - [Config File](#config-file)
 - [Project Structure](#project-structure)
@@ -58,6 +72,7 @@ CTRL+C at any point triggers a **graceful interrupt**: partial data collected so
 botstrike/
 ├── botstrike.py            Entry point — CLI parsing, orchestration, CTRL+C handler
 ├── config.yaml             Default configuration (overridden by CLI flags)
+├── nodes.yaml.example      Fleet config template for distributed mode
 ├── wordlists/
 │   └── useragents.txt      200+ real browser UA strings (Chrome, Firefox, Safari, Edge, mobile)
 ├── modules/
@@ -66,13 +81,14 @@ botstrike/
 │   ├── recon.py            robots.txt + sitemap.xml parser + homepage link extractor
 │   ├── scraper.py          Stealth and aggressive scraping + product data extraction
 │   ├── ddos.py             4-vector bot flood engine with live Rich dashboard
-│   └── reporter.py         Scoring, recommendations, JSON + HTML report generation
+│   ├── reporter.py         Scoring, recommendations, JSON + HTML report generation
+│   └── distributor.py      SSH orchestration engine for distributed fleet execution
 └── templates/
     ├── report.html.j2      Per-target HTML report (dark theme, Chart.js)
     └── comparison.html.j2  Side-by-side comparison report
 ```
 
-**Data flow:**
+**Data flow (single target):**
 
 ```
 botstrike.py
@@ -92,7 +108,15 @@ botstrike.py
     │       ├─ reporter.build_json_report()
     │       └─ reporter.build_html_report()
     │
-    └─ [compare mode] reporter.build_comparison_html(result_a, result_b)
+    ├─ [compare mode]      reporter.build_comparison_html(result_a, result_b)
+    │
+    └─ [distributed mode]  distributor.run_distributed(url, args, cfg)
+                               │
+                               ├─ [thread: node-sg-01]  SSH → upload → run → download
+                               ├─ [thread: node-fr-01]  SSH → upload → run → download
+                               └─ [thread: node-us-01]  SSH → upload → run → download
+                                       ↓ all complete
+                               distributor.merge_results() → merged_report.json
 ```
 
 ---
@@ -145,6 +169,23 @@ python botstrike.py --compare \
     --url-a https://site-with-datadome.com --label-a "DataDome" \
     --url-b https://site-with-crowdsec.com --label-b "CrowdSec" \
     --mode full --confirm-authorized
+
+# ── Distributed mode (multi-VPS fleet) ──────────────────────────────────────
+
+# First time: bootstrap all nodes (upload + install deps)
+python botstrike.py --setup-nodes
+
+# Distributed scraping across all nodes simultaneously
+python botstrike.py --url https://shop.example.com --mode scrape --distributed
+
+# Distributed full test (each node from its own IP)
+python botstrike.py --url https://shop.example.com \
+    --mode full --confirm-authorized --distributed
+
+# Distributed full test, custom nodes file, heavy profile
+python botstrike.py --url https://shop.example.com \
+    --mode full --confirm-authorized --distributed \
+    --nodes /path/to/my_nodes.yaml --profile heavy
 ```
 
 ---
@@ -200,6 +241,14 @@ python botstrike.py [OPTIONS]
 | `--url-b URL` | — | Second target URL (e.g. the CrowdSec-protected site). |
 | `--label-a NAME` | `Target A` | Human-readable label for Target A in the comparison report. |
 | `--label-b NAME` | `Target B` | Human-readable label for Target B in the comparison report. |
+
+### distributed mode
+
+| Flag | Default | Description |
+|---|---|---|
+| `--distributed` | off | Run BotStrike simultaneously across all nodes in `--nodes`. Each node sends traffic from its own IP. Results are merged locally into a fleet report. |
+| `--nodes FILE` | `nodes.yaml` | Path to the fleet config YAML. See [Step 3 — Create nodes.yaml](#step-3--create-nodesyaml) for format. |
+| `--setup-nodes` | off | Bootstrap mode — connect to all nodes, upload BotStrike, install dependencies, run smoke test, then exit. No `--url` needed. Run this once before the first engagement. |
 
 ---
 
@@ -502,6 +551,529 @@ python botstrike.py --compare \
 ```
 
 All flags (`--mode`, `--profile`, `--rps`, `--duration`, `--proxy`) apply equally to both targets.
+
+---
+
+## Distributed Mode
+
+Distributed mode lets you run BotStrike across a fleet of Linux VPS nodes simultaneously with a single command. Every node executes the full pipeline independently from its own public IP address. This is the correct way to test bot protection against realistic multi-source traffic — bypassing per-IP rate limiting, generating geographically diverse requests, and producing a combined picture of how the target behaves under pressure from many sources at once.
+
+All orchestration happens over SSH. There is no agent to install on the VPS nodes, no daemon to run, no open ports to expose. BotStrike uploads itself, installs its own dependencies, runs, and downloads results — all automatically.
+
+---
+
+### How Distributed Mode Works
+
+```
+Your local machine                       Remote VPS fleet
+──────────────────                       ──────────────────────────────────────
+botstrike.py --distributed
+    │
+    ├── Read nodes.yaml                  
+    ├── Launch one thread per node ──────┬─► node-sg-01 (Singapore)
+    │                                    ├─► node-fr-01 (Paris)      [parallel]
+    │                                    └─► node-us-01 (New York)   [parallel]
+    │
+    │   Per node (simultaneous):
+    │     1. SSH connect (key auth)
+    │     2. SFTP upload botstrike/ → ~/botstrike/
+    │     3. pip install -r requirements.txt
+    │     4. python3 botstrike.py --url <TARGET> --yes [flags...]
+    │     5. Stream stdout back in real-time → live dashboard
+    │     6. SFTP download JSON + HTML report
+    │     7. Parse key metrics (score, blocked%, requests)
+    │
+    ├── Live fleet table refreshes every 500ms (all nodes visible)
+    │
+    └── When all threads finish:
+          merge_results() → reports/distributed_<ts>/merged_report.json
+          Print fleet summary to terminal
+```
+
+**Why this matters for engagements:**
+
+A single-IP test is trivially blocked by rate limiting — the WAF blocks you, not the bot pattern. With 5 VPS nodes each sending 100 RPS from different IPs and countries, you have 500 combined RPS from 5 distinct sources. The WAF now needs to detect the *behavior pattern*, not just count requests per IP. That is where DataDome and CrowdSec are genuinely differentiated, and where the distributed results become meaningful evidence for your client.
+
+---
+
+### Prerequisites
+
+**On your local machine:**
+- Python 3.9+ with BotStrike installed
+- `paramiko` Python library (`pip install paramiko`)
+- SSH private key with access to each VPS
+
+**On each VPS node:**
+- Debian / Ubuntu / Kali Linux (any modern version)
+- Python 3.9 or newer
+- `pip3` / `python3-pip`
+- Outbound internet access to the target domain
+- SSH listening on the configured port, accessible from your local IP
+
+```bash
+# Minimum VPS setup (run on each node if needed)
+apt update && apt install -y python3 python3-pip
+```
+
+No other software needs to be installed on the VPS nodes. BotStrike handles everything else automatically via `--setup-nodes`.
+
+---
+
+### Step 1 — Generate a Dedicated SSH Key
+
+Generate one key pair specifically for BotStrike. Do **not** reuse your personal SSH key — this keeps your fleet credentials isolated and easy to rotate.
+
+```bash
+ssh-keygen -t ed25519 -C "botstrike-fleet" -f ~/.ssh/botstrike_key
+```
+
+This creates two files:
+- `~/.ssh/botstrike_key` — your private key (stays on your machine, never shared)
+- `~/.ssh/botstrike_key.pub` — the public key (will be installed on each VPS)
+
+Use `ed25519` for modern elliptic-curve security. If your VPS provider requires RSA:
+
+```bash
+ssh-keygen -t rsa -b 4096 -C "botstrike-fleet" -f ~/.ssh/botstrike_key
+```
+
+---
+
+### Step 2 — Authorize the Key on Every VPS
+
+Push the public key to each VPS so BotStrike can connect without a password:
+
+```bash
+ssh-copy-id -i ~/.ssh/botstrike_key.pub root@1.2.3.4
+ssh-copy-id -i ~/.ssh/botstrike_key.pub ubuntu@5.6.7.8
+ssh-copy-id -i ~/.ssh/botstrike_key.pub kali@9.10.11.12
+```
+
+Verify that key-only login works before proceeding:
+
+```bash
+ssh -i ~/.ssh/botstrike_key root@1.2.3.4 "echo connected"
+# Output: connected
+```
+
+If you cannot use `ssh-copy-id` (e.g. VPS was provisioned with a password only), add the key manually:
+
+```bash
+# On the VPS, as root or the target user:
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+echo "<paste contents of ~/.ssh/botstrike_key.pub here>" >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+---
+
+### Step 3 — Create nodes.yaml
+
+Copy the example file and fill in your VPS details:
+
+```bash
+cp nodes.yaml.example nodes.yaml
+```
+
+Edit `nodes.yaml`:
+
+```yaml
+nodes:
+
+  - id: node-sg-01          # Label shown in reports and live dashboard
+    host: 1.2.3.4           # VPS public IP or hostname
+    user: root              # SSH user
+    key: ~/.ssh/botstrike_key  # Path to private key on YOUR machine
+    port: 22               # SSH port (optional — defaults to 22)
+
+  - id: node-fr-01
+    host: 5.6.7.8
+    user: ubuntu
+    key: ~/.ssh/botstrike_key
+
+  - id: node-us-east-01
+    host: 9.10.11.12
+    user: kali
+    key: ~/.ssh/botstrike_key
+```
+
+**Field reference:**
+
+| Field | Required | Description |
+|---|---|---|
+| `id` | yes | Friendly identifier. Appears in the live dashboard, per-node reports, and merged JSON. Use descriptive names like `sg-01`, `fr-vpn`, `us-east`. |
+| `host` | yes | VPS public IP address or fully qualified domain name. |
+| `user` | yes | SSH username. Must have Python 3.9+ and pip available. |
+| `key` | yes | Absolute or `~`-prefixed path to the **private** key file on your local machine. |
+| `port` | no | SSH port. Defaults to `22` if omitted. |
+
+`nodes.yaml` is permanently excluded from git via `.gitignore`. It will never be committed regardless of how many times you run `git add .`.
+
+---
+
+### Step 4 — Bootstrap the Fleet
+
+Run the setup command once before your first engagement. This connects to every node in parallel, uploads BotStrike, installs all Python dependencies, and runs a smoke test:
+
+```bash
+python botstrike.py --setup-nodes
+```
+
+You will see a live table showing each node's progress through the setup stages:
+
+```
+╭───────────────────────────────────────────────────────────────────────────╮
+│  BotStrike Distributed  ·  node setup  ·  3 nodes  ·  0 done  ·  12s    │
+├────────────────┬──────────────────┬──────────────┬─────────┬─────────────┤
+│ Node           │ Status           │ Phase        │ Elapsed │ Last        │
+├────────────────┼──────────────────┼──────────────┼─────────┼─────────────┤
+│ node-sg-01     │ ✓  DONE          │ —            │ 18s     │ Node ready  │
+│ node-fr-01     │ ⚙  INSTALLING    │ —            │ 12s     │ Running pip │
+│ node-us-east-01│ ↑  UPLOADING     │ —            │ 6s      │ Uploaded 14 │
+╰────────────────┴──────────────────┴──────────────┴─────────┴─────────────╯
+```
+
+When complete:
+
+```
+  Ready: 3/3   Failed: 0
+
+  Nodes are ready. Run:
+    python botstrike.py --url <TARGET> --distributed --nodes nodes.yaml
+```
+
+If a node fails, the error is shown inline. Common causes and fixes are in [Troubleshooting](#troubleshooting).
+
+**Using a custom nodes file:**
+
+```bash
+python botstrike.py --setup-nodes --nodes /path/to/my_nodes.yaml
+```
+
+**Re-running setup is safe.** Files are overwritten, pip skips already-installed packages, and the smoke test re-validates everything. Run it again any time you update BotStrike.
+
+---
+
+### Step 5 — Run a Distributed Test
+
+#### Scraping only (no authorization required)
+
+```bash
+python botstrike.py \
+    --url https://shop.example.com \
+    --mode scrape \
+    --distributed
+```
+
+#### Full test including bot flood
+
+```bash
+python botstrike.py \
+    --url https://shop.example.com \
+    --mode full \
+    --confirm-authorized \
+    --distributed
+```
+
+#### Non-interactive (scripted / CI)
+
+```bash
+python botstrike.py \
+    --url https://shop.example.com \
+    --mode full \
+    --confirm-authorized \
+    --distributed \
+    --yes \
+    --operator "j.doe@company.com"
+```
+
+#### Heavy profile — maximum pressure from all nodes
+
+```bash
+python botstrike.py \
+    --url https://shop.example.com \
+    --mode full \
+    --confirm-authorized \
+    --distributed \
+    --profile heavy \
+    --rps 300 \
+    --duration 120
+```
+
+With 5 nodes at `--profile heavy`, you get 5 × 300 = **1,500 combined RPS** from 5 distinct IPs, each running for 120 seconds per vector.
+
+#### Custom nodes file
+
+```bash
+python botstrike.py \
+    --url https://shop.example.com \
+    --mode scrape \
+    --distributed \
+    --nodes /etc/botstrike/engagement_nodes.yaml
+```
+
+---
+
+### Live Fleet Dashboard
+
+While a distributed run is in progress, BotStrike displays a live table that refreshes every 500ms. It shows all nodes simultaneously:
+
+```
+╭────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  BotStrike Distributed  ·  https://shop.example.com  ·  3 nodes  ·  1 done  ·  0 failed  ·  142s  │
+├──────────────────┬─────────────────┬──────────────────┬──────────┬──────────┬────────┬────────┬────╮
+│ Node             │ Status          │ Phase            │ Requests │ Blocked% │ Score  │Elapsed │... │
+├──────────────────┼─────────────────┼──────────────────┼──────────┼──────────┼────────┼────────┤    │
+│ node-sg-01       │ ✓  DONE         │ Reporting        │ 1,842    │ 34.2%    │ C (67) │ 187s   │    │
+│ node-fr-01       │ ●  RUNNING      │ HTTP Flood       │ 18,431   │ 71.0%    │ —      │ 142s   │    │
+│ node-us-east-01  │ ●  RUNNING      │ Stealth Scrape   │ 203      │ 12.1%    │ —      │ 142s   │    │
+╰──────────────────┴─────────────────┴──────────────────┴──────────┴──────────┴────────┴────────┴────╯
+```
+
+**Column descriptions:**
+
+| Column | Description |
+|---|---|
+| Node | The `id` from `nodes.yaml` |
+| Status | `CONNECTING` → `UPLOADING` → `INSTALLING` → `RUNNING` → `DONE` / `FAILED` |
+| Phase | Current pipeline phase inferred from the node's stdout (`Pre-Flight`, `Recon`, `Stealth Scrape`, `Aggressive Scrape`, `HTTP Flood`, `Slowloris`, `POST Flood`, `Cache Buster`, `Reporting`) |
+| Requests | Total HTTP requests sent so far by this node |
+| Blocked% | Average of stealth blocked% and aggressive blocked% (populated after node finishes) |
+| Score | Protection grade and numeric score (populated after report is downloaded) |
+| Elapsed | Wall-clock seconds since this node's thread started |
+| Last Activity | Most recent stdout line from the remote run, or error message on failure |
+
+---
+
+### Distributed Output Structure
+
+All output is saved locally under `reports/distributed_<YYYYMMDD_HHMMSS>/`:
+
+```
+reports/
+└── distributed_20260506_143021/
+    ├── merged_report.json          ← Aggregated fleet results (main deliverable)
+    │
+    ├── node-sg-01/
+    │   ├── botstrike_<id>.json     ← Full individual report from this node
+    │   └── botstrike_<id>.html     ← Individual HTML dashboard from this node
+    │
+    ├── node-fr-01/
+    │   ├── botstrike_<id>.json
+    │   └── botstrike_<id>.html
+    │
+    └── node-us-east-01/
+        ├── botstrike_<id>.json
+        └── botstrike_<id>.html
+```
+
+- Individual JSON/HTML reports are full standard BotStrike reports, identical to what a single-node run would produce. They can be opened directly in a browser.
+- `merged_report.json` aggregates all nodes into one document (see below).
+- The `distributed_<ts>/` folder name is the engagement timestamp and is unique per run.
+
+---
+
+### Merged Report Format
+
+`merged_report.json` has three top-level sections:
+
+```json
+{
+  "distributed": {
+    "node_count": 3,
+    "nodes_ok": 3,
+    "nodes_failed": 0,
+    "target": "https://shop.example.com",
+    "generated_at": "2026-05-06T14:52:11Z",
+    "tool_version": "1.0"
+  },
+
+  "aggregated": {
+    "total_requests_stealth": 4821,
+    "total_requests_aggressive": 9102,
+    "total_requests_all": 13923,
+    "items_extracted_total": 247,
+    "stealth_blocked_pct_avg": 28.4,
+    "aggressive_blocked_pct_avg": 61.7,
+    "ddos_vectors": {
+      "http_flood": {
+        "total_requests": 54300,
+        "rps_combined": 287.4,
+        "blocked_pct_avg": 71.2,
+        "latency_avg_ms": 143.8
+      },
+      "slowloris":    { ... },
+      "post_flood":   { ... },
+      "cache_buster": { ... }
+    },
+    "score": 68,
+    "grade": "C",
+    "recommendations": [ { "priority", "title", "detail" }, ... ]
+  },
+
+  "per_node": [
+    {
+      "node_id": "node-sg-01",
+      "host": "1.2.3.4",
+      "status": "DONE",
+      "score": 67,
+      "grade": "C",
+      "blocked_pct": 34.2,
+      "requests": 1842,
+      "html_report": "reports/distributed_.../node-sg-01/botstrike_abc123.html",
+      "json_report": "reports/distributed_.../node-sg-01/botstrike_abc123.json",
+      "log_tail": ["[SCRAPE:STEALTH] ...", "..."],
+      "data": { <full botstrike JSON for this node> }
+    },
+    { ... },
+    { ... }
+  ]
+}
+```
+
+**Aggregation logic:**
+
+| Metric | How it is combined |
+|---|---|
+| `total_requests_*` | Sum across all nodes |
+| `stealth_blocked_pct_avg` | Weighted average by request count per node |
+| `aggressive_blocked_pct_avg` | Weighted average by request count per node |
+| `ddos_vectors.total_requests` | Sum (nodes run the same vectors simultaneously) |
+| `ddos_vectors.rps_combined` | Sum of each node's avg RPS (real combined throughput) |
+| `ddos_vectors.blocked_pct_avg` | Average across nodes |
+| `score` | Average of all nodes' numeric scores |
+| `grade` | Derived from the averaged score |
+| `recommendations` | Union of all nodes' recommendations, deduplicated by title |
+
+---
+
+### Distributed CLI Reference
+
+| Flag | Requires | Description |
+|---|---|---|
+| `--distributed` | `--url`, `nodes.yaml` present | Enable fleet mode. Uploads, runs, and collects from all nodes simultaneously. |
+| `--nodes FILE` | — | Override the default `nodes.yaml` path. Useful when managing multiple client engagement node files. |
+| `--setup-nodes` | `nodes.yaml` present | Bootstrap all nodes. No `--url` needed. Idempotent — safe to re-run. |
+
+All other flags pass through to each remote node unchanged:
+
+| Passed through | Not passed through |
+|---|---|
+| `--mode`, `--confirm-authorized`, `--yes` | `--distributed` (would cause infinite loop) |
+| `--profile`, `--rps`, `--duration`, `--connections` | `--proxy` (each node connects directly from its own IP — that is the point) |
+| `--operator` (suffixed with `@<node_id>`) | `--compare`, `--url-a`, `--url-b` |
+| `--config` | `--nodes`, `--setup-nodes` |
+
+---
+
+### Security Model
+
+BotStrike's distributed mode is designed so that no sensitive data ever leaves your machine unintentionally, and no persistent footprint is left on the VPS nodes.
+
+**Authentication:**
+- SSH key-only authentication. Passwords are never used, stored, or prompted for.
+- The private key never leaves your local machine. Only the public key is installed on VPS nodes.
+- A dedicated key pair (`botstrike_key`) is recommended so it can be rotated independently of your personal keys.
+- BotStrike uses `paramiko` with `look_for_keys=False` and `allow_agent=False`, meaning it uses only the explicitly specified key file.
+
+**What is uploaded to each node:**
+- The BotStrike Python source code (no secrets, no reports, no config)
+- `nodes.yaml` is explicitly excluded from the SFTP upload — VPS IPs are never sent to other VPS nodes
+- Previously generated reports are excluded from the upload
+- `.git/` is excluded
+
+**What stays on the VPS after a run:**
+- `~/botstrike/` — the uploaded source code and generated reports
+- The reports in `~/botstrike/reports/` are downloaded to your local machine and can then be deleted remotely
+
+**`nodes.yaml` is gitignored.** The file containing your VPS IPs and key paths cannot be accidentally committed regardless of how you use git in this directory.
+
+**Host key verification:** BotStrike uses `AutoAddPolicy` (equivalent to `StrictHostKeyChecking=no`) for first-time connections. This is intentional for pentest tooling where nodes are provisioned fresh per engagement. If you require strict verification, you can modify `_connect()` in `modules/distributor.py` to use `RejectPolicy` and provide a known_hosts file.
+
+---
+
+### Troubleshooting
+
+**Node shows `FAILED: SSH key not found: ~/.ssh/botstrike_key`**
+
+The key path in `nodes.yaml` does not resolve to an existing file on your local machine. Check the path:
+
+```bash
+ls -la ~/.ssh/botstrike_key
+```
+
+If it does not exist, run [Step 1](#step-1--generate-a-dedicated-ssh-key) again.
+
+---
+
+**Node shows `FAILED: Auth failed — check SSH key`**
+
+The public key is not in the VPS's `authorized_keys` file. Run:
+
+```bash
+ssh-copy-id -i ~/.ssh/botstrike_key.pub <user>@<host>
+# Then verify:
+ssh -i ~/.ssh/botstrike_key <user>@<host> "echo ok"
+```
+
+---
+
+**Node shows `FAILED: pip install failed`**
+
+Python or pip is missing on the VPS:
+
+```bash
+ssh -i ~/.ssh/botstrike_key <user>@<host> "python3 --version && pip3 --version"
+```
+
+Install if missing:
+
+```bash
+ssh -i ~/.ssh/botstrike_key root@<host> "apt update && apt install -y python3 python3-pip"
+```
+
+Then re-run `--setup-nodes`.
+
+---
+
+**Node shows `FAILED: [Errno 111] Connection refused`**
+
+SSH is not running on the expected port, or a firewall is blocking it:
+
+```bash
+# Test connectivity from your machine
+nc -zv <host> <port>
+# Check SSH on the VPS (if you have another way in)
+systemctl status ssh
+ufw allow 22
+```
+
+---
+
+**Node shows `DONE` but `merged_report.json` shows it with no data**
+
+The remote botstrike run exited before generating a report (e.g. target was unreachable from that node, or Python version was too old). Check the node's log:
+
+```bash
+# The last 30 log lines are embedded in merged_report.json
+cat reports/distributed_*/merged_report.json | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for n in d['per_node']:
+    print('\\n---', n['node_id'])
+    print('\\n'.join(n['log_tail']))
+"
+```
+
+---
+
+**`paramiko` is not installed**
+
+```bash
+pip install paramiko
+# or
+pip install -r requirements.txt
+```
 
 ---
 

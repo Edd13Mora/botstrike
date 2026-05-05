@@ -15,6 +15,9 @@ ENV/
 # BotStrike runtime output — never commit reports
 reports/
 
+# Fleet config contains VPS IPs and SSH key paths — never commit
+nodes.yaml
+
 # Logs
 *.log
 
