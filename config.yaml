@@ -1,0 +1,35 @@
+# BotStrike v1.0 — Default Configuration
+
+target: ""
+mode: "full"           # scrape | ddos | full
+output: "report"
+confirm_authorized: false
+
+scraping:
+  stealth:
+    threads: 3
+    delay_min: 1.5
+    delay_max: 4.0
+    max_pages: 100
+  aggressive:
+    threads: 10
+    max_pages: 200
+    path_guessing: true
+
+ddos:
+  rps: 100
+  duration: 60
+  connections: 200        # slowloris concurrent connections
+  ramp_up_seconds: 30
+  pause_between_vectors: 10
+
+preflight:
+  timeout: 10
+  probe_timeout: 8
+
+reporting:
+  include_body_snippets: true
+  body_snippet_length: 300
+
+logging:
+  level: "INFO"           # DEBUG | INFO | WARNING

@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BotStrike Report — {{ session.target }}</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --bg2: #161b22; --bg3: #21262d; --bg4: #2d333b;
+    --border: #30363d; --text: #e6edf3; --muted: #8b949e;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149;
+    --blue: #58a6ff; --cyan: #79c0ff; --purple: #bc8cff; --orange: #e3b341;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; line-height: 1.5; }
+  a { color: var(--blue); text-decoration: none; }
+  h2 { font-size: 1.25rem; font-weight: 600; color: var(--cyan); border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 16px; }
+  h3 { font-size: 0.95rem; font-weight: 600; color: var(--muted); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+  /* ── Header ── */
+  .header { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 28px 32px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
+  .header h1 { font-size: 1.8rem; font-weight: 700; color: var(--cyan); }
+  .header .subtitle { color: var(--muted); margin-top: 4px; font-size: 0.9rem; }
+  .header-right { text-align: right; font-size: 0.82rem; color: var(--muted); line-height: 2; white-space: nowrap; }
+  .tag { display: inline-block; background: var(--bg3); border: 1px solid var(--border); border-radius: 4px; padding: 1px 7px; font-size: 0.75rem; color: var(--muted); font-family: monospace; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.3px; }
+  .badge-green  { background: rgba(63,185,80,0.15);  color: var(--green);  border: 1px solid rgba(63,185,80,0.35); }
+  .badge-yellow { background: rgba(210,153,34,0.15); color: var(--yellow); border: 1px solid rgba(210,153,34,0.35); }
+  .badge-red    { background: rgba(248,81,73,0.15);  color: var(--red);    border: 1px solid rgba(248,81,73,0.35); }
+  .badge-blue   { background: rgba(88,166,255,0.15); color: var(--blue);   border: 1px solid rgba(88,166,255,0.35); }
+
+  /* ── Section wrapper ── */
+  .section { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 24px; margin-bottom: 20px; }
+
+  /* ── Score hero ── */
+  .score-hero { display: flex; align-items: center; gap: 32px; margin-bottom: 24px; }
+  .grade-circle { width: 90px; height: 90px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 2.8rem; font-weight: 900; flex-shrink: 0; border: 3px solid; }
+  .grade-A { background: rgba(63,185,80,0.12);  color: #3fb950; border-color: #3fb950; }
+  .grade-B { background: rgba(63,185,80,0.08);  color: #7ee787; border-color: #7ee787; }
+  .grade-C { background: rgba(210,153,34,0.12); color: #d29922; border-color: #d29922; }
+  .grade-D { background: rgba(248,81,73,0.10);  color: #f0883e; border-color: #f0883e; }
+  .grade-F { background: rgba(248,81,73,0.15);  color: #f85149; border-color: #f85149; }
+  .score-details { flex: 1; }
+  .score-bar-wrap { background: var(--bg3); border-radius: 6px; height: 10px; margin: 8px 0 4px; overflow: hidden; }
+  .score-bar { height: 100%; border-radius: 6px; transition: width 0.6s ease; }
+  .score-findings { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+  .finding { font-size: 0.75rem; padding: 3px 9px; border-radius: 20px; }
+  .finding-PASS     { background: rgba(63,185,80,0.10);  color: var(--green);  border: 1px solid rgba(63,185,80,0.25); }
+  .finding-CRITICAL { background: rgba(248,81,73,0.15);  color: var(--red);    border: 1px solid rgba(248,81,73,0.3); }
+  .finding-HIGH     { background: rgba(248,81,73,0.08);  color: #f0883e;       border: 1px solid rgba(248,81,73,0.2); }
+  .finding-MEDIUM   { background: rgba(210,153,34,0.12); color: var(--yellow); border: 1px solid rgba(210,153,34,0.3); }
+  .finding-LOW      { background: rgba(88,166,255,0.10); color: var(--blue);   border: 1px solid rgba(88,166,255,0.25); }
+
+  /* ── KPI grid ── */
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; margin-bottom: 20px; }
+  .kpi { background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; text-align: center; position: relative; }
+  .kpi-value { font-size: 1.8rem; font-weight: 700; margin-bottom: 4px; }
+  .kpi-label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.4px; }
+  .kpi-delta { position: absolute; top: 8px; right: 10px; font-size: 0.7rem; font-weight: 700; }
+  .delta-up   { color: var(--green); }
+  .delta-down { color: var(--red); }
+  .kpi-green  .kpi-value { color: var(--green); }
+  .kpi-yellow .kpi-value { color: var(--yellow); }
+  .kpi-red    .kpi-value { color: var(--red); }
+  .kpi-blue   .kpi-value { color: var(--cyan); }
+
+  /* ── Recommendations ── */
+  .rec { border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; display: flex; gap: 14px; }
+  .rec-icon { font-size: 1.3rem; flex-shrink: 0; padding-top: 2px; }
+  .rec-CRITICAL { border-left: 4px solid var(--red); }
+  .rec-HIGH     { border-left: 4px solid #f0883e; }
+  .rec-MEDIUM   { border-left: 4px solid var(--yellow); }
+  .rec-LOW      { border-left: 4px solid var(--blue); }
+  .rec-title    { font-weight: 600; margin-bottom: 4px; }
+  .rec-detail   { color: var(--muted); font-size: 0.85rem; line-height: 1.5; }
+
+  /* ── Tables ── */
+  table { width: 100%; border-collapse: collapse; font-size: 0.83rem; }
+  th { background: var(--bg3); color: var(--muted); text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); font-weight: 600; text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.4px; }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; word-break: break-all; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  .code-200  { color: var(--green);  font-weight: 600; }
+  .code-301, .code-302 { color: var(--yellow); font-weight: 600; }
+  .code-403, .code-429, .code-503 { color: var(--red); font-weight: 600; }
+  .code-0    { color: var(--muted);  font-weight: 600; }
+  .snippet   { font-family: monospace; font-size: 0.77rem; color: var(--muted); max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ── Block-type badges ── */
+  .bt { display: inline-block; font-size: 0.68rem; font-weight: 700; padding: 1px 7px; border-radius: 3px; white-space: nowrap; }
+  .bt-HARD_BLOCK       { background: rgba(248,81,73,0.18);  color: var(--red); }
+  .bt-CAPTCHA_CHALLENGE{ background: rgba(188,140,255,0.18);color: var(--purple); }
+  .bt-RATE_LIMIT       { background: rgba(210,153,34,0.18); color: var(--yellow); }
+  .bt-SOFT_REDIRECT    { background: rgba(88,166,255,0.15); color: var(--blue); }
+  .bt-REDIRECT         { background: rgba(88,166,255,0.10); color: var(--muted); }
+  .bt-OTHER            { background: rgba(139,148,158,0.15);color: var(--muted); }
+  .bt-ERROR            { background: rgba(139,148,158,0.10);color: var(--muted); }
+
+  /* ── Charts ── */
+  .chart-row  { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 20px; }
+  .chart-box  { background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .chart-box canvas { max-height: 250px; }
+
+  /* ── DDoS vectors ── */
+  .ddos-vector { margin-bottom: 16px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .ddos-vector-header { background: var(--bg3); padding: 11px 16px; font-weight: 600; color: var(--cyan); display: flex; justify-content: space-between; align-items: center; }
+  .ddos-vector-body { padding: 14px 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
+  .metric-label { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.4px; }
+  .metric-value { font-size: 1.1rem; font-weight: 600; }
+  .lat-row { display: flex; gap: 12px; }
+  .lat-chip { background: var(--bg4); border-radius: 4px; padding: 2px 8px; font-size: 0.78rem; }
+  .lat-chip span { color: var(--muted); font-size: 0.68rem; }
+
+  /* ── Historical delta banner ── */
+  .delta-banner { background: rgba(88,166,255,0.07); border: 1px solid rgba(88,166,255,0.2); border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; font-size: 0.85rem; color: var(--blue); }
+
+  /* ── Warn banner ── */
+  .warn-banner { background: rgba(210,153,34,0.1); border: 1px solid rgba(210,153,34,0.3); border-radius: 8px; padding: 11px 16px; color: var(--yellow); margin-bottom: 16px; font-size: 0.85rem; }
+
+  /* ── Footer ── */
+  .footer { text-align: center; padding: 24px; color: var(--muted); font-size: 0.78rem; border-top: 1px solid var(--border); margin-top: 32px; }
+
+  @media (max-width: 900px) {
+    .chart-row { grid-template-columns: 1fr; }
+    .header { flex-direction: column; }
+    .score-hero { flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- ── HEADER ─────────────────────────────────────────────────────── -->
+  <div class="header">
+    <div>
+      <h1>⚡ BotStrike v{{ tool_version }}</h1>
+      <div class="subtitle">Bot Protection Effectiveness Test Report</div>
+      <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        <span class="tag">{{ session.target }}</span>
+        {% if session.authorized %}
+          <span class="badge badge-green">✓ Authorized</span>
+        {% else %}
+          <span class="badge badge-red">⚠ Not Confirmed</span>
+        {% endif %}
+        {% if session.get('label') %}
+          <span class="badge badge-blue">{{ session.label }}</span>
+        {% endif %}
+      </div>
+    </div>
+    <div class="header-right">
+      <div><strong>Session:</strong> <span class="tag">{{ session.id[:8] }}…</span></div>
+      <div><strong>Operator:</strong> {{ session.operator or 'N/A' }}</div>
+      <div><strong>Start:</strong> {{ session.start_time }}</div>
+      <div><strong>End:</strong> {{ session.end_time or '—' }}</div>
+      <div><strong>Generated:</strong> {{ generated_at }}</div>
+    </div>
+  </div>
+
+  <!-- ── PROTECTION SCORE ───────────────────────────────────────────── -->
+  <div class="section">
+    <h2>Protection Score</h2>
+    {% set g = score.grade|default('?') %}
+    {% set s = score.score|default(0) %}
+    {% set bar_color = '#3fb950' if s >= 80 else '#d29922' if s >= 50 else '#f85149' %}
+    <div class="score-hero">
+      <div class="grade-circle grade-{{ g }}">{{ g }}</div>
+      <div class="score-details">
+        <div style="font-size:1.1rem; font-weight:600; color:var(--text);">
+          {{ s }}<span style="color:var(--muted); font-size:0.85rem;">/100</span>
+          {% if deltas.score is defined %}
+            {% set d = deltas.score %}
+            <span style="font-size:0.85rem; margin-left:10px;" class="{{ 'delta-up' if d > 0 else 'delta-down' }}">
+              {{ '+' if d > 0 else '' }}{{ d }} vs prev
+            </span>
+          {% endif %}
+        </div>
+        <div class="score-bar-wrap">
+          <div class="score-bar" style="width:{{ s }}%; background:{{ bar_color }};"></div>
+        </div>
+        <div style="color:var(--muted); font-size:0.8rem;">A=90+ · B=80+ · C=65+ · D=50+ · F=&lt;50</div>
+        <div class="score-findings">
+          {% for f in score.findings|default([]) %}
+            <span class="finding finding-{{ f.sev }}" title="{{ f.msg }}">
+              {{ '✓' if f.sev == 'PASS' else '!' }} {{ f.msg | truncate(55) }}
+            </span>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── EXECUTIVE SUMMARY ──────────────────────────────────────────── -->
+  <div class="section">
+    <h2>Executive Summary</h2>
+
+    {% if deltas and (deltas.stealth_blocked_pct is defined or deltas.aggressive_blocked_pct is defined) %}
+    <div class="delta-banner">
+      ↕ Comparison vs previous run
+      {% if deltas.stealth_blocked_pct is defined %}
+        &nbsp;|&nbsp; Stealth blocked:
+        <strong>{{ '+' if deltas.stealth_blocked_pct > 0 else '' }}{{ deltas.stealth_blocked_pct }}%</strong>
+      {% endif %}
+      {% if deltas.aggressive_blocked_pct is defined %}
+        &nbsp;|&nbsp; Aggressive blocked:
+        <strong>{{ '+' if deltas.aggressive_blocked_pct > 0 else '' }}{{ deltas.aggressive_blocked_pct }}%</strong>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    <div class="kpi-grid">
+      <div class="kpi kpi-blue">
+        <div class="kpi-value">{{ "{:,}".format(total_requests) }}</div>
+        <div class="kpi-label">Total Requests</div>
+      </div>
+
+      <div class="kpi {% if overall_blocked_pct > 70 %}kpi-green{% elif overall_blocked_pct > 30 %}kpi-yellow{% else %}kpi-red{% endif %}">
+        <div class="kpi-value">{{ overall_blocked_pct }}%</div>
+        <div class="kpi-label">Overall Blocked</div>
+      </div>
+
+      <div class="kpi {% if preflight.waf_detected != 'None detected' %}kpi-red{% else %}kpi-green{% endif %}">
+        <div class="kpi-value" style="font-size:1rem; padding-top:10px;">{{ preflight.waf_detected }}</div>
+        <div class="kpi-label">WAF / Bot Protection</div>
+      </div>
+
+      <div class="kpi {% if preflight.blocking_mode == 'ACTIVE' %}kpi-green{% else %}kpi-red{% endif %}">
+        <div class="kpi-value" style="font-size:0.95rem; padding-top:12px;">{{ preflight.blocking_mode }}</div>
+        <div class="kpi-label">Blocking Mode</div>
+      </div>
+
+      <div class="kpi kpi-blue">
+        <div class="kpi-value" style="font-size:0.95rem; padding-top:12px;">{{ preflight.cdn_detected }}</div>
+        <div class="kpi-label">CDN</div>
+      </div>
+
+      {% set stealth_pct = stealth.blocked_pct|default(0) %}
+      <div class="kpi {% if stealth_pct > 70 %}kpi-green{% elif stealth_pct > 30 %}kpi-yellow{% else %}kpi-red{% endif %}">
+        {% if deltas.stealth_blocked_pct is defined %}
+          {% set d = deltas.stealth_blocked_pct %}
+          <div class="kpi-delta {{ 'delta-up' if d > 0 else 'delta-down' }}">{{ '+' if d > 0 else '' }}{{ d }}%</div>
+        {% endif %}
+        <div class="kpi-value">{{ stealth_pct }}%</div>
+        <div class="kpi-label">Stealth Blocked</div>
+      </div>
+
+      {% set agg_pct = aggressive.blocked_pct|default(0) %}
+      <div class="kpi {% if agg_pct > 70 %}kpi-green{% elif agg_pct > 30 %}kpi-yellow{% else %}kpi-red{% endif %}">
+        {% if deltas.aggressive_blocked_pct is defined %}
+          {% set d = deltas.aggressive_blocked_pct %}
+          <div class="kpi-delta {{ 'delta-up' if d > 0 else 'delta-down' }}">{{ '+' if d > 0 else '' }}{{ d }}%</div>
+        {% endif %}
+        <div class="kpi-value">{{ agg_pct }}%</div>
+        <div class="kpi-label">Aggressive Blocked</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── RECOMMENDATIONS ───────────────────────────────────────────── -->
+  {% if recommendations %}
+  <div class="section">
+    <h2>Recommendations</h2>
+    {% set icons = {'CRITICAL': '🚨', 'HIGH': '🔴', 'MEDIUM': '🟡', 'LOW': '🔵'} %}
+    {% for rec in recommendations %}
+    <div class="rec rec-{{ rec.priority }}">
+      <div class="rec-icon">{{ icons.get(rec.priority, '•') }}</div>
+      <div>
+        <div class="rec-title">
+          <span class="badge {% if rec.priority == 'CRITICAL' %}badge-red{% elif rec.priority == 'HIGH' %}badge-red{% elif rec.priority == 'MEDIUM' %}badge-yellow{% else %}badge-blue{% endif %}" style="margin-right:8px;">{{ rec.priority }}</span>
+          {{ rec.title }}
+        </div>
+        <div class="rec-detail">{{ rec.detail }}</div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <!-- ── WAF FINGERPRINTING ──────────────────────────────────────────── -->
+  <div class="section">
+    <h2>WAF & Security Fingerprinting</h2>
+    <table>
+      <thead>
+        <tr><th>Probe</th><th>Description</th><th>HTTP Code</th><th>URL</th><th>Timestamp</th></tr>
+      </thead>
+      <tbody>
+        {% for probe in preflight.probe_results %}
+        <tr>
+          <td style="white-space:nowrap; font-weight:600;">{{ probe.probe_name }}</td>
+          <td style="color:var(--muted); font-size:0.8rem;">{{ probe.get('probe_desc', '') }}</td>
+          <td class="code-{{ probe.status }}">{{ probe.status }}</td>
+          <td><a href="{{ probe.url }}">{{ probe.url | truncate(55) }}</a></td>
+          <td style="white-space:nowrap; color:var(--muted);">{{ probe.timestamp }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" style="color:var(--muted)">No probe data.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <div style="margin-top:20px; display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:14px;">
+      <div>
+        <div class="kpi-label" style="margin-bottom:6px;">Tech Stack</div>
+        {% for t in preflight.tech_stack %}
+          <span class="tag">{{ t }}</span>
+        {% else %}
+          <span class="tag">Unknown</span>
+        {% endfor %}
+      </div>
+      <div>
+        <div class="kpi-label" style="margin-bottom:6px;">HTTPS / HSTS</div>
+        <span class="badge {% if preflight.https_enforced %}badge-green{% else %}badge-red{% endif %}">
+          HTTPS {{ 'enforced' if preflight.https_enforced else 'missing' }}
+        </span>
+        &nbsp;
+        <span class="badge {% if preflight.hsts %}badge-green{% else %}badge-yellow{% endif %}">
+          HSTS {{ 'present' if preflight.hsts else 'missing' }}
+        </span>
+      </div>
+      <div>
+        <div class="kpi-label" style="margin-bottom:6px;">Discovery</div>
+        <span class="badge {% if preflight.robots_txt %}badge-blue{% else %}badge-yellow{% endif %}">
+          robots.txt {{ 'found' if preflight.robots_txt else 'not found' }}
+        </span>
+        &nbsp;
+        <span class="badge {% if preflight.sitemap_xml %}badge-blue{% else %}badge-yellow{% endif %}">
+          sitemap.xml {{ 'found' if preflight.sitemap_xml else 'not found' }}
+        </span>
+      </div>
+      {% if preflight.waf_notes %}
+      <div>
+        <div class="kpi-label" style="margin-bottom:6px;">WAF Notes</div>
+        <span style="font-size:0.82rem; color:var(--muted);">{{ preflight.waf_notes }}</span>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- ── SCRAPING RESULTS ────────────────────────────────────────────── -->
+  <div class="section">
+    <h2>Scraping Results</h2>
+    {% for phase_data, label, delta_key in [
+        (stealth,     'Phase 2A — Stealth Mode (Human Simulation)',    'stealth_blocked_pct'),
+        (aggressive,  'Phase 2B — Aggressive Mode (Obvious Bot)',      'aggressive_blocked_pct')
+    ] %}
+    <h3>{{ label }}</h3>
+    <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:16px;">
+      <div class="kpi kpi-blue" style="padding:12px;">
+        <div class="kpi-value" style="font-size:1.4rem;">{{ phase_data.total_requests|default(0) }}</div>
+        <div class="kpi-label">Requests</div>
+      </div>
+      <div class="kpi {% set p=phase_data.blocked_pct|default(0) %}{% if p > 70 %}kpi-green{% elif p > 30 %}kpi-yellow{% else %}kpi-red{% endif %}" style="padding:12px;">
+        {% if deltas[delta_key] is defined %}
+          {% set d = deltas[delta_key] %}
+          <div class="kpi-delta {{ 'delta-up' if d > 0 else 'delta-down' }}">{{ '+' if d > 0 else '' }}{{ d }}%</div>
+        {% endif %}
+        <div class="kpi-value" style="font-size:1.4rem;">{{ phase_data.blocked_pct|default(0) }}%</div>
+        <div class="kpi-label">Blocked</div>
+      </div>
+      <div class="kpi kpi-blue" style="padding:12px;">
+        <div class="kpi-value" style="font-size:1.4rem;">{{ phase_data.items_extracted|default(0) }}</div>
+        <div class="kpi-label">Items Extracted</div>
+      </div>
+      <div class="kpi kpi-blue" style="padding:12px;">
+        <div class="kpi-value" style="font-size:1.4rem;">{{ phase_data.pages_crawled|default(0) }}</div>
+        <div class="kpi-label">Pages Crawled</div>
+      </div>
+      <div class="kpi kpi-blue" style="padding:12px;">
+        <div class="kpi-value" style="font-size:1.4rem;">{{ phase_data.duration_s|default(0) }}s</div>
+        <div class="kpi-label">Duration</div>
+      </div>
+    </div>
+
+    {% if phase_data.sample_items %}
+    <table style="margin-bottom:24px;">
+      <thead><tr><th>Product Name</th><th>Price</th><th>URL</th></tr></thead>
+      <tbody>
+        {% for item in phase_data.sample_items[:8] %}
+        <tr>
+          <td>{{ item.name or '—' }}</td>
+          <td>{{ item.price or '—' }}</td>
+          <td><a href="{{ item.url }}">{{ item.url | truncate(55) }}</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+    {% endfor %}
+
+    <div class="chart-row">
+      <div class="chart-box">
+        <h3>Stealth — Response Code Distribution</h3>
+        <canvas id="chartStealth"></canvas>
+      </div>
+      <div class="chart-box">
+        <h3>Aggressive — Response Code Distribution</h3>
+        <canvas id="chartAggressive"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── DDOS RESULTS ────────────────────────────────────────────────── -->
+  {% if ddos_vectors %}
+  <div class="section">
+    <h2>DDoS Simulation Results</h2>
+    <div class="warn-banner">⚠ Authorized L7 HTTP stress test. All vectors executed with explicit written authorization.</div>
+
+    {% for vec in ddos_vectors %}
+    <div class="ddos-vector">
+      <div class="ddos-vector-header">
+        {{ vec.name }}
+        <span class="badge {% if vec.blocked_pct > 70 %}badge-green{% elif vec.blocked_pct > 30 %}badge-yellow{% else %}badge-red{% endif %}">
+          {{ vec.blocked_pct }}% blocked
+        </span>
+      </div>
+      <div class="ddos-vector-body">
+        <div>
+          <div class="metric-label">Total Requests</div>
+          <div class="metric-value">{{ "{:,}".format(vec.total_requests|default(0)) }}</div>
+        </div>
+        <div>
+          <div class="metric-label">Avg / Peak RPS</div>
+          <div class="metric-value">{{ vec.rps_avg|default(0) }} / {{ vec.rps_peak|default(0) }}</div>
+        </div>
+        <div>
+          <div class="metric-label">Latency (avg / p95 / p99)</div>
+          <div class="lat-row" style="margin-top:4px;">
+            <span class="lat-chip">{{ vec.latency_avg_ms|default(0) }}<span>ms avg</span></span>
+            <span class="lat-chip">{{ vec.latency_p95_ms|default(0) }}<span>ms p95</span></span>
+            <span class="lat-chip">{{ vec.latency_p99_ms|default(0) }}<span>ms p99</span></span>
+          </div>
+        </div>
+        <div>
+          <div class="metric-label">Duration</div>
+          <div class="metric-value">{{ vec.duration_s|default(0) }}s</div>
+        </div>
+        <div>
+          <div class="metric-label">200 / 403 / 429 / ERR</div>
+          <div style="margin-top:4px; display:flex; gap:6px; flex-wrap:wrap;">
+            <span class="lat-chip" style="color:var(--green)">{{ (vec.responses or {}).get('200',0) }}</span>
+            <span class="lat-chip" style="color:var(--red)">{{ (vec.responses or {}).get('403',0) }}</span>
+            <span class="lat-chip" style="color:var(--yellow)">{{ (vec.responses or {}).get('429',0) }}</span>
+            <span class="lat-chip" style="color:var(--muted)">{{ (vec.responses or {}).get('error',0) }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+
+    <div class="chart-row">
+      <div class="chart-box">
+        <h3>DDoS — Response Code Distribution</h3>
+        <canvas id="chartDdosCodes"></canvas>
+      </div>
+      <div class="chart-box">
+        <h3>DDoS — Blocked vs Passed per Vector</h3>
+        <canvas id="chartDdosBlocked"></canvas>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- ── DETECTION EVIDENCE ──────────────────────────────────────────── -->
+  <div class="section">
+    <h2>Detection Evidence</h2>
+    {% if evidence %}
+    <p style="color:var(--muted); margin-bottom:12px; font-size:0.82rem;">
+      Showing {{ [evidence|length, 100]|min }} of {{ evidence|length }} blocked/challenged requests.
+      Full list available in the JSON report.
+    </p>
+    <div style="overflow-x:auto;">
+    <table>
+      <thead>
+        <tr>
+          <th>Timestamp</th><th>Phase</th><th>Block Type</th>
+          <th>HTTP Code</th><th>URL</th><th>Body Snippet</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in evidence[:100] %}
+        <tr>
+          <td style="white-space:nowrap; color:var(--muted);">{{ e.timestamp }}</td>
+          <td><span class="tag">{{ e.phase }}</span></td>
+          <td><span class="bt bt-{{ e.get('block_type','HARD_BLOCK') }}">{{ e.get('block_type','HARD_BLOCK') }}</span></td>
+          <td class="code-{{ e.http_code }}">{{ e.http_code }}</td>
+          <td><a href="{{ e.url }}">{{ e.url | truncate(50) }}</a></td>
+          <td class="snippet">{{ e.body_snippet | truncate(80) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% else %}
+    <p style="color:var(--muted);">No blocked requests detected — WAF may be in passive/detection-only mode.</p>
+    {% endif %}
+  </div>
+
+  <!-- ── FOOTER ──────────────────────────────────────────────────────── -->
+  <div class="footer">
+    <p><strong>BotStrike v{{ tool_version }}</strong> — For authorized security testing only. Unauthorized use is illegal.</p>
+    <p style="margin-top:6px;">
+      Session: <span class="tag">{{ session.id }}</span>
+      &nbsp;|&nbsp; Operator: {{ session.operator or 'N/A' }}
+      &nbsp;|&nbsp; Generated: {{ generated_at }}
+    </p>
+  </div>
+
+</div><!-- /.container -->
+
+<script>
+const PALETTE = {
+  green:'rgba(63,185,80,0.85)',   yellow:'rgba(210,153,34,0.85)',
+  red:  'rgba(248,81,73,0.85)',   blue:  'rgba(88,166,255,0.85)',
+  grey: 'rgba(139,148,158,0.85)', purple:'rgba(188,140,255,0.85)',
+};
+Chart.defaults.color = '#8b949e';
+Chart.defaults.borderColor = '#21262d';
+
+function donut(id, labels, data, colors) {
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  new Chart(ctx, {
+    type: 'doughnut',
+    data: { labels, datasets: [{ data, backgroundColor: colors, borderWidth: 1, borderColor: '#21262d' }] },
+    options: { cutout: '60%', plugins: { legend: { labels: { color: '#8b949e' } } } },
+  });
+}
+function bar(id, labels, datasets) {
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  new Chart(ctx, {
+    type: 'bar',
+    data: { labels, datasets },
+    options: { responsive: true, plugins: { legend: { labels: { color:'#8b949e' } } },
+               scales: { x:{ticks:{color:'#8b949e'}}, y:{ticks:{color:'#8b949e'}} } },
+  });
+}
+
+// Stealth donut
+(function(){
+  const d = {{ stealth.responses | tojson if stealth.responses else '{}' }};
+  donut('chartStealth',
+    ['200','403','429','503','Other','Error'],
+    [d['200']||0, d['403']||0, d['429']||0, d['503']||0, d['other']||0, d['error']||0],
+    [PALETTE.green, PALETTE.red, PALETTE.yellow, PALETTE.purple, PALETTE.blue, PALETTE.grey]
+  );
+})();
+
+// Aggressive donut
+(function(){
+  const d = {{ aggressive.responses | tojson if aggressive.responses else '{}' }};
+  donut('chartAggressive',
+    ['200','403','429','503','Other','Error'],
+    [d['200']||0, d['403']||0, d['429']||0, d['503']||0, d['other']||0, d['error']||0],
+    [PALETTE.green, PALETTE.red, PALETTE.yellow, PALETTE.purple, PALETTE.blue, PALETTE.grey]
+  );
+})();
+
+// DDoS code breakdown
+(function(){
+  const vecs = {{ ddos_vectors | tojson }};
+  if (!vecs.length) return;
+  const labels = vecs.map(v => v.name);
+  bar('chartDdosCodes', labels, [
+    { label:'200 OK',        data: vecs.map(v=>(v.responses||{})['200']||0),   backgroundColor: PALETTE.green  },
+    { label:'403 Blocked',   data: vecs.map(v=>(v.responses||{})['403']||0),   backgroundColor: PALETTE.red    },
+    { label:'429 Rate Lim',  data: vecs.map(v=>(v.responses||{})['429']||0),   backgroundColor: PALETTE.yellow },
+    { label:'503',           data: vecs.map(v=>(v.responses||{})['503']||0),   backgroundColor: PALETTE.purple },
+    { label:'Errors',        data: vecs.map(v=>(v.responses||{})['error']||0), backgroundColor: PALETTE.grey   },
+  ]);
+})();
+
+// DDoS blocked vs passed stacked
+(function(){
+  const vecs = {{ ddos_vectors | tojson }};
+  if (!vecs.length) return;
+  const labels = vecs.map(v => v.name);
+  bar('chartDdosBlocked', labels, [
+    { label:'Passed %',  data: vecs.map(v=>parseFloat((100-(v.blocked_pct||0)).toFixed(1))), backgroundColor: PALETTE.green, stack:'a' },
+    { label:'Blocked %', data: vecs.map(v=>v.blocked_pct||0),                               backgroundColor: PALETTE.red,   stack:'a' },
+  ]);
+})();
+</script>
+</body>
+</html>

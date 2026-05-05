@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BotStrike — Comparison Report</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg:#0d1117; --bg2:#161b22; --bg3:#21262d; --bg4:#2d333b;
+    --border:#30363d; --text:#e6edf3; --muted:#8b949e;
+    --green:#3fb950; --yellow:#d29922; --red:#f85149;
+    --blue:#58a6ff; --cyan:#79c0ff; --purple:#bc8cff;
+    --a:#58a6ff; --b:#3fb950;   /* Target A=blue, Target B=green */
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,sans-serif; font-size:14px; line-height:1.5; }
+  .container { max-width:1400px; margin:0 auto; padding:24px; }
+  h2 { font-size:1.2rem; font-weight:600; color:var(--cyan); border-bottom:1px solid var(--border); padding-bottom:8px; margin-bottom:16px; }
+  h3 { font-size:0.85rem; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:10px; }
+  .section { background:var(--bg2); border:1px solid var(--border); border-radius:10px; padding:22px; margin-bottom:20px; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:20px; font-size:0.72rem; font-weight:700; }
+  .badge-a { background:rgba(88,166,255,0.15); color:var(--blue); border:1px solid rgba(88,166,255,0.35); }
+  .badge-b { background:rgba(63,185,80,0.15);  color:var(--green); border:1px solid rgba(63,185,80,0.35); }
+  .tag { display:inline-block; background:var(--bg3); border:1px solid var(--border); border-radius:4px; padding:1px 7px; font-size:0.75rem; font-family:monospace; color:var(--muted); }
+  a { color:var(--blue); text-decoration:none; }
+
+  /* ── Hero header ── */
+  .hero { background:var(--bg2); border:1px solid var(--border); border-radius:10px; padding:28px 32px; margin-bottom:20px; }
+  .hero h1 { font-size:1.8rem; font-weight:700; color:var(--cyan); margin-bottom:6px; }
+  .vs-row { display:flex; align-items:center; gap:24px; margin-top:16px; flex-wrap:wrap; }
+  .target-card { background:var(--bg3); border:1px solid var(--border); border-radius:8px; padding:14px 20px; flex:1; min-width:220px; }
+  .target-card .label { font-size:0.75rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.4px; margin-bottom:4px; }
+  .target-card .url { font-family:monospace; font-size:0.9rem; }
+  .vs-divider { font-size:2rem; font-weight:900; color:var(--muted); flex-shrink:0; }
+
+  /* ── Grade circle ── */
+  .grade-circle { width:72px; height:72px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:2.2rem; font-weight:900; border:3px solid; flex-shrink:0; }
+  .grade-A { background:rgba(63,185,80,0.12);  color:#3fb950; border-color:#3fb950; }
+  .grade-B { background:rgba(63,185,80,0.08);  color:#7ee787; border-color:#7ee787; }
+  .grade-C { background:rgba(210,153,34,0.12); color:#d29922; border-color:#d29922; }
+  .grade-D { background:rgba(248,81,73,0.10);  color:#f0883e; border-color:#f0883e; }
+  .grade-F { background:rgba(248,81,73,0.15);  color:#f85149; border-color:#f85149; }
+
+  /* ── Comparison grid ── */
+  .cmp-grid { display:grid; grid-template-columns:1fr 2fr 2fr; gap:0; }
+  .cmp-grid .col-h { background:var(--bg3); padding:10px 14px; font-size:0.75rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.4px; border-bottom:1px solid var(--border); }
+  .cmp-grid .col-a { border-left:3px solid var(--a); }
+  .cmp-grid .col-b { border-left:3px solid var(--b); }
+  .cmp-row { display:contents; }
+  .cmp-row > div { padding:10px 14px; border-bottom:1px solid var(--border); }
+  .cmp-row:last-child > div { border-bottom:none; }
+  .cmp-label { color:var(--muted); font-size:0.85rem; display:flex; align-items:center; }
+  .cmp-val { font-weight:600; font-size:0.95rem; }
+  .win { color:var(--green); }
+  .lose { color:var(--red); }
+  .tie { color:var(--yellow); }
+
+  /* ── Metric bar ── */
+  .pct-bar { height:6px; border-radius:3px; margin-top:5px; background:var(--bg4); overflow:hidden; }
+  .pct-fill { height:100%; border-radius:3px; }
+
+  /* ── Recs ── */
+  .rec-mini { border-left:3px solid var(--border); padding:8px 12px; margin-bottom:8px; background:var(--bg3); border-radius:0 6px 6px 0; font-size:0.82rem; }
+  .rec-CRITICAL { border-left-color:var(--red); }
+  .rec-HIGH     { border-left-color:#f0883e; }
+  .rec-MEDIUM   { border-left-color:var(--yellow); }
+  .rec-LOW      { border-left-color:var(--blue); }
+  .rec-label { font-weight:700; font-size:0.72rem; text-transform:uppercase; }
+
+  /* ── Charts ── */
+  .chart-row { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px; }
+  .chart-box { background:var(--bg3); border:1px solid var(--border); border-radius:8px; padding:14px; }
+  .chart-box canvas { max-height:220px; }
+
+  /* ── Winner verdict ── */
+  .verdict { background:var(--bg3); border:1px solid var(--border); border-radius:10px; padding:22px; display:flex; align-items:center; gap:24px; flex-wrap:wrap; }
+  .verdict-grade { text-align:center; }
+  .verdict-label { font-size:0.75rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }
+  .verdict-name { font-size:1.3rem; font-weight:700; margin:4px 0; }
+  .verdict-detail { color:var(--muted); font-size:0.85rem; flex:1; }
+
+  .footer { text-align:center; padding:20px; color:var(--muted); font-size:0.78rem; border-top:1px solid var(--border); margin-top:28px; }
+  @media(max-width:900px){ .cmp-grid{grid-template-columns:1fr;} .chart-row{grid-template-columns:1fr;} .vs-row{flex-direction:column;} }
+</style>
+</head>
+<body>
+<div class="container">
+
+  {% set a_label = a.session.get('label', 'Target A') %}
+  {% set b_label = b.session.get('label', 'Target B') %}
+  {% set a_score = a.score.score|default(0) %}
+  {% set b_score = b.score.score|default(0) %}
+  {% set a_grade = a.score.grade|default('?') %}
+  {% set b_grade = b.score.grade|default('?') %}
+
+  <!-- ── HERO ─────────────────────────────────────────────────────── -->
+  <div class="hero">
+    <h1>⚡ BotStrike — Comparison Report</h1>
+    <p style="color:var(--muted); margin-bottom:16px;">Side-by-side bot protection effectiveness comparison</p>
+    <div class="vs-row">
+      <div class="target-card">
+        <div class="label"><span class="badge badge-a">A</span> &nbsp;{{ a_label }}</div>
+        <div class="url">{{ a.session.target }}</div>
+        <div style="margin-top:8px; color:var(--muted); font-size:0.8rem;">
+          WAF: <strong style="color:var(--text);">{{ a.preflight.waf_detected }}</strong>
+          &nbsp;|&nbsp; CDN: <strong style="color:var(--text);">{{ a.preflight.cdn_detected }}</strong>
+        </div>
+      </div>
+      <div class="vs-divider">VS</div>
+      <div class="target-card">
+        <div class="label"><span class="badge badge-b">B</span> &nbsp;{{ b_label }}</div>
+        <div class="url">{{ b.session.target }}</div>
+        <div style="margin-top:8px; color:var(--muted); font-size:0.8rem;">
+          WAF: <strong style="color:var(--text);">{{ b.preflight.waf_detected }}</strong>
+          &nbsp;|&nbsp; CDN: <strong style="color:var(--text);">{{ b.preflight.cdn_detected }}</strong>
+        </div>
+      </div>
+    </div>
+    <div style="margin-top:12px; color:var(--muted); font-size:0.8rem;">
+      Generated: {{ generated_at }} &nbsp;|&nbsp; BotStrike v{{ tool_version }}
+    </div>
+  </div>
+
+  <!-- ── VERDICT ───────────────────────────────────────────────────── -->
+  <div class="section">
+    <h2>Verdict</h2>
+    {% set winner_label = a_label if a_score > b_score else (b_label if b_score > a_score else 'Tie') %}
+    {% set winner_grade = a_grade if a_score > b_score else (b_grade if b_score > a_score else '=') %}
+    {% set winner_score = [a_score, b_score]|max if a_score != b_score else a_score %}
+    <div class="verdict">
+      <div class="verdict-grade">
+        {% if a_score != b_score %}
+        <div class="grade-circle grade-{{ winner_grade }}">{{ winner_grade }}</div>
+        {% else %}
+        <div style="font-size:2rem; color:var(--yellow);">≈</div>
+        {% endif %}
+      </div>
+      <div>
+        <div class="verdict-label">
+          {% if a_score > b_score %}Winner{% elif b_score > a_score %}Winner{% else %}Result{% endif %}
+        </div>
+        <div class="verdict-name">
+          {% if a_score == b_score %}
+            Tie — Both solutions scored {{ a_score }}/100
+          {% else %}
+            {{ winner_label }} wins ({{ winner_score }}/100 vs {{ [a_score, b_score]|min }}/100)
+          {% endif %}
+        </div>
+        <div class="verdict-detail">
+          {% if a_score > b_score %}
+            {{ a_label }} demonstrated {{ a_score - b_score }} points stronger overall bot protection
+            across all test phases. Score difference driven primarily by
+            {% set a_stealth = a.scraping.stealth.blocked_pct|default(0) %}
+            {% set b_stealth = b.scraping.stealth.blocked_pct|default(0) %}
+            {% if a_stealth > b_stealth %}stealth scraping detection{% else %}aggressive bot blocking{% endif %}.
+          {% elif b_score > a_score %}
+            {{ b_label }} demonstrated {{ b_score - a_score }} points stronger overall bot protection
+            across all test phases.
+          {% else %}
+            Both solutions performed equivalently across all test phases.
+            Review individual phase breakdowns for nuanced differences.
+          {% endif %}
+        </div>
+      </div>
+      <div style="display:flex; gap:24px; text-align:center;">
+        <div>
+          <div class="grade-circle grade-{{ a_grade }}" style="width:60px;height:60px;font-size:1.8rem;">{{ a_grade }}</div>
+          <div style="font-size:0.75rem; color:var(--muted); margin-top:4px;">{{ a_label }}</div>
+          <div style="font-weight:700; color:var(--a);">{{ a_score }}/100</div>
+        </div>
+        <div>
+          <div class="grade-circle grade-{{ b_grade }}" style="width:60px;height:60px;font-size:1.8rem;">{{ b_grade }}</div>
+          <div style="font-size:0.75rem; color:var(--muted); margin-top:4px;">{{ b_label }}</div>
+          <div style="font-weight:700; color:var(--b);">{{ b_score }}/100</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── SIDE-BY-SIDE METRICS ───────────────────────────────────────── -->
+  <div class="section">
+    <h2>Side-by-Side Metrics</h2>
+    <div class="cmp-grid">
+      <div class="col-h">Metric</div>
+      <div class="col-h col-a"><span class="badge badge-a">A</span> &nbsp;{{ a_label }}</div>
+      <div class="col-h col-b"><span class="badge badge-b">B</span> &nbsp;{{ b_label }}</div>
+
+      {% macro cmp_row(label, a_val, b_val, higher_is_better=true, unit='') %}
+      {% set a_f = a_val|float(0) %}
+      {% set b_f = b_val|float(0) %}
+      {% set a_better = (a_f > b_f) if higher_is_better else (a_f < b_f) %}
+      {% set b_better = (b_f > a_f) if higher_is_better else (b_f < a_f) %}
+      <div class="cmp-row">
+        <div class="cmp-label">{{ label }}</div>
+        <div class="cmp-val {{ 'win' if a_better else ('lose' if b_better else 'tie') }}">
+          {{ a_val }}{{ unit }}
+          {% if a_better %} ▲{% elif b_better %} ▼{% endif %}
+        </div>
+        <div class="cmp-val {{ 'win' if b_better else ('lose' if a_better else 'tie') }}">
+          {{ b_val }}{{ unit }}
+          {% if b_better %} ▲{% elif a_better %} ▼{% endif %}
+        </div>
+      </div>
+      {% endmacro %}
+
+      {{ cmp_row('Protection Score',        a_score,                           b_score,                           true, '/100') }}
+      {{ cmp_row('WAF Detected',            a.preflight.waf_detected,          b.preflight.waf_detected) }}
+      {{ cmp_row('Blocking Mode',           a.preflight.blocking_mode,         b.preflight.blocking_mode) }}
+      {{ cmp_row('CDN Layer',               a.preflight.cdn_detected,          b.preflight.cdn_detected) }}
+      {{ cmp_row('Stealth Blocked %',       a.scraping.stealth.blocked_pct|default(0),    b.scraping.stealth.blocked_pct|default(0),    true, '%') }}
+      {{ cmp_row('Aggressive Blocked %',    a.scraping.aggressive.blocked_pct|default(0), b.scraping.aggressive.blocked_pct|default(0), true, '%') }}
+      {{ cmp_row('Items Scraped (Stealth)', a.scraping.stealth.items_extracted|default(0),    b.scraping.stealth.items_extracted|default(0),    false) }}
+      {{ cmp_row('Items Scraped (Aggress)', a.scraping.aggressive.items_extracted|default(0), b.scraping.aggressive.items_extracted|default(0), false) }}
+      {{ cmp_row('HSTS Enabled',            'Yes' if a.preflight.hsts else 'No', 'Yes' if b.preflight.hsts else 'No') }}
+    </div>
+  </div>
+
+  <!-- ── SCRAPING COMPARISON CHART ──────────────────────────────────── -->
+  <div class="section">
+    <h2>Scraping Phase Comparison</h2>
+    <div class="chart-row">
+      <div class="chart-box">
+        <h3>Blocked % — Stealth vs Aggressive</h3>
+        <canvas id="chartScrapeBlocked"></canvas>
+      </div>
+      <div class="chart-box">
+        <h3>Items Extracted (lower = better protected)</h3>
+        <canvas id="chartItems"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── DDOS COMPARISON ────────────────────────────────────────────── -->
+  {% if a.ddos or b.ddos %}
+  <div class="section">
+    <h2>DDoS Phase Comparison</h2>
+    <div class="cmp-grid">
+      <div class="col-h">Vector</div>
+      <div class="col-h col-a"><span class="badge badge-a">A</span> {{ a_label }} — Blocked %</div>
+      <div class="col-h col-b"><span class="badge badge-b">B</span> {{ b_label }} — Blocked %</div>
+
+      {% set all_vec_names = [] %}
+      {% for vn in a.ddos.keys() %}{% if all_vec_names.append(vn) %}{% endif %}{% endfor %}
+      {% for vn in b.ddos.keys() %}{% if vn not in all_vec_names and all_vec_names.append(vn) %}{% endif %}{% endfor %}
+
+      {% for vn in all_vec_names %}
+      {% set av = a.ddos.get(vn, {}) %}
+      {% set bv = b.ddos.get(vn, {}) %}
+      {% set ap = av.get('blocked_pct', 0) %}
+      {% set bp = bv.get('blocked_pct', 0) %}
+      <div class="cmp-row">
+        <div class="cmp-label">{{ vn.replace('_',' ').title() }}</div>
+        <div class="cmp-val {{ 'win' if ap > bp else ('lose' if bp > ap else 'tie') }}">
+          {{ ap }}% {% if ap > bp %}▲{% elif bp > ap %}▼{% endif %}
+          <div class="pct-bar"><div class="pct-fill" style="width:{{ ap }}%; background:var(--a);"></div></div>
+        </div>
+        <div class="cmp-val {{ 'win' if bp > ap else ('lose' if ap > bp else 'tie') }}">
+          {{ bp }}% {% if bp > ap %}▲{% elif ap > bp %}▼{% endif %}
+          <div class="pct-bar"><div class="pct-fill" style="width:{{ bp }}%; background:var(--b);"></div></div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="chart-row" style="margin-top:20px;">
+      <div class="chart-box">
+        <h3>DDoS Blocked % per Vector</h3>
+        <canvas id="chartDdosCompare"></canvas>
+      </div>
+      <div class="chart-box">
+        <h3>Avg Latency (ms) — Higher = WAF adds overhead</h3>
+        <canvas id="chartLatency"></canvas>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- ── RECOMMENDATIONS ────────────────────────────────────────────── -->
+  <div class="section">
+    <h2>Recommendations</h2>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
+      <div>
+        <h3><span class="badge badge-a">A</span> {{ a_label }}</h3>
+        {% for rec in a.recommendations[:5] %}
+        <div class="rec-mini rec-{{ rec.priority }}">
+          <div class="rec-label" style="color:{% if rec.priority=='CRITICAL' %}var(--red){% elif rec.priority=='HIGH' %}#f0883e{% elif rec.priority=='MEDIUM' %}var(--yellow){% else %}var(--blue){% endif %};">
+            {{ rec.priority }}
+          </div>
+          <div style="font-weight:600; margin-top:2px;">{{ rec.title }}</div>
+          <div style="color:var(--muted); font-size:0.8rem; margin-top:3px;">{{ rec.detail | truncate(150) }}</div>
+        </div>
+        {% else %}
+        <p style="color:var(--muted); font-size:0.85rem;">No critical recommendations.</p>
+        {% endfor %}
+      </div>
+      <div>
+        <h3><span class="badge badge-b">B</span> {{ b_label }}</h3>
+        {% for rec in b.recommendations[:5] %}
+        <div class="rec-mini rec-{{ rec.priority }}">
+          <div class="rec-label" style="color:{% if rec.priority=='CRITICAL' %}var(--red){% elif rec.priority=='HIGH' %}#f0883e{% elif rec.priority=='MEDIUM' %}var(--yellow){% else %}var(--blue){% endif %};">
+            {{ rec.priority }}
+          </div>
+          <div style="font-weight:600; margin-top:2px;">{{ rec.title }}</div>
+          <div style="color:var(--muted); font-size:0.8rem; margin-top:3px;">{{ rec.detail | truncate(150) }}</div>
+        </div>
+        {% else %}
+        <p style="color:var(--muted); font-size:0.85rem;">No critical recommendations.</p>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <!-- ── FOOTER ── -->
+  <div class="footer">
+    <p><strong>BotStrike v{{ tool_version }}</strong> — For authorized security testing only.</p>
+    <p style="margin-top:4px;">Generated: {{ generated_at }}</p>
+  </div>
+
+</div>
+
+<script>
+Chart.defaults.color = '#8b949e';
+Chart.defaults.borderColor = '#21262d';
+const COL_A = 'rgba(88,166,255,0.85)';
+const COL_B = 'rgba(63,185,80,0.85)';
+
+function bar(id, labels, datasets) {
+  const ctx = document.getElementById(id);
+  if (!ctx) return;
+  new Chart(ctx, {
+    type: 'bar', data: { labels, datasets },
+    options: { responsive: true, plugins:{legend:{labels:{color:'#8b949e'}}},
+               scales:{x:{ticks:{color:'#8b949e'}},y:{ticks:{color:'#8b949e'}}} },
+  });
+}
+
+// Scraping blocked %
+bar('chartScrapeBlocked',
+  ['Stealth', 'Aggressive'],
+  [
+    { label: '{{ a_label }}', data: [{{ a.scraping.stealth.blocked_pct|default(0) }}, {{ a.scraping.aggressive.blocked_pct|default(0) }}], backgroundColor: COL_A },
+    { label: '{{ b_label }}', data: [{{ b.scraping.stealth.blocked_pct|default(0) }}, {{ b.scraping.aggressive.blocked_pct|default(0) }}], backgroundColor: COL_B },
+  ]
+);
+
+// Items extracted
+bar('chartItems',
+  ['Stealth Items', 'Aggressive Items'],
+  [
+    { label: '{{ a_label }}', data: [{{ a.scraping.stealth.items_extracted|default(0) }}, {{ a.scraping.aggressive.items_extracted|default(0) }}], backgroundColor: COL_A },
+    { label: '{{ b_label }}', data: [{{ b.scraping.stealth.items_extracted|default(0) }}, {{ b.scraping.aggressive.items_extracted|default(0) }}], backgroundColor: COL_B },
+  ]
+);
+
+// DDoS blocked %
+(function(){
+  const aD = {{ a.ddos | tojson }};
+  const bD = {{ b.ddos | tojson }};
+  const names = [...new Set([...Object.keys(aD||{}), ...Object.keys(bD||{})])];
+  if (!names.length) return;
+  const labels = names.map(n => n.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase()));
+  bar('chartDdosCompare', labels, [
+    { label: '{{ a_label }}', data: names.map(n=>(aD[n]||{}).blocked_pct||0), backgroundColor: COL_A },
+    { label: '{{ b_label }}', data: names.map(n=>(bD[n]||{}).blocked_pct||0), backgroundColor: COL_B },
+  ]);
+  bar('chartLatency', labels, [
+    { label: '{{ a_label }}', data: names.map(n=>(aD[n]||{}).latency_avg_ms||0), backgroundColor: COL_A },
+    { label: '{{ b_label }}', data: names.map(n=>(bD[n]||{}).latency_avg_ms||0), backgroundColor: COL_B },
+  ]);
+})();
+</script>
+</body>
+</html>
