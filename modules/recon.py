@@ -1,5 +1,7 @@
 import logging
 import re
+import shutil
+import subprocess
 import threading
 from collections import defaultdict
 from pathlib import Path
@@ -305,6 +307,69 @@ def _probe_paths(base_url: str, paths: list[str], timeout: int,
     return results
 
 
+# ── Katana integration (optional external enrichment) ─────────────────────────
+
+_KATANA_TIMEOUT = 120  # max seconds to wait for katana to finish
+
+
+def _run_katana(target_url: str, base_host: str,
+                logger: Optional[logging.Logger] = None) -> list[str]:
+    """
+    Run Katana (projectdiscovery/katana) if it is installed, and return
+    discovered URLs filtered to the same domain.
+
+    Flags used:
+      -d 3   crawl depth 3 levels deep
+      -jc    parse JavaScript files for additional endpoints
+      -ps    passive mode — pulls historical URLs from Wayback Machine + CommonCrawl
+      -silent  suppress all output except URLs (one per line to stdout)
+      -timeout 10  per-request timeout in seconds
+
+    Returns an empty list (silently) if katana is not on PATH or fails.
+    """
+    if not shutil.which("katana"):
+        return []
+
+    log("[RECON] Katana detected — running headless JS crawl + passive sources...", "info", logger)
+    console.print("  [bold cyan][katana][/bold cyan] Crawling (JS + passive)...", end="", flush=True)
+
+    try:
+        proc = subprocess.run(
+            [
+                "katana",
+                "-u", target_url,
+                "-d", "3",
+                "-jc",
+                "-ps",
+                "-silent",
+                "-timeout", "10",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_KATANA_TIMEOUT,
+        )
+        urls: list[str] = []
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("http") and _is_internal(line, base_host) and not _is_static(line):
+                urls.append(line)
+        console.print(f" [bold green]{len(urls)} URLs[/bold green]")
+        log(f"  Katana → {len(urls)} URLs discovered", "success", logger)
+        return urls
+
+    except subprocess.TimeoutExpired:
+        console.print(f" [yellow]timed out after {_KATANA_TIMEOUT}s — using partial output[/yellow]")
+        log(f"  Katana timed out after {_KATANA_TIMEOUT}s", "warning", logger)
+        return []
+    except FileNotFoundError:
+        # katana disappeared between which() and run() — race condition, just skip
+        return []
+    except Exception as e:
+        console.print(f" [dim]skipped ({e})[/dim]")
+        log(f"  Katana error: {e}", "warning", logger)
+        return []
+
+
 # ── Main recon runner ─────────────────────────────────────────────────────────
 
 def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = None) -> dict:
@@ -314,6 +379,7 @@ def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = N
         "allowed_paths":         [],
         "sitemap_urls":          [],
         "crawled_urls":          [],
+        "katana_urls":           0,
         "js_paths_extracted":    0,
         "guessed_paths_probed":  0,
         "guessed_paths_live":    0,
@@ -334,6 +400,12 @@ def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = N
 
     discovered: set[str] = set()
     all_js_urls: set[str] = set()
+
+    # ── 0. Katana (optional — enriches with headless JS + passive sources) ────
+    katana_urls = _run_katana(target_url, base_host, logger)
+    if katana_urls:
+        discovered.update(katana_urls)
+        result["katana_urls"] = len(katana_urls)
 
     # ── 1. robots.txt ─────────────────────────────────────────────────────────
     log("[RECON] Fetching robots.txt...", "info", logger)
@@ -461,6 +533,8 @@ def _print_recon_summary(r: dict) -> None:
     table.add_column("Source",  style="bold white", width=32)
     table.add_column("Count",   justify="right")
 
+    if r.get("katana_urls"):
+        table.add_row("[bold cyan]Katana (JS + passive)[/bold cyan]", f"[bold cyan]{r['katana_urls']}[/bold cyan]")
     table.add_row("robots.txt disallowed",    str(len(r["disallowed_paths"])))
     table.add_row("sitemap.xml URLs",         str(len(r["sitemap_urls"])))
     table.add_row("Homepage links (deep HTML)", str(len(r["crawled_urls"])))
