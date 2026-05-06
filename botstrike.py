@@ -41,6 +41,8 @@ def _check_python() -> None:
 
 
 def _check_deps() -> None:
+    import shutil
+
     rows: list[tuple[str, str, str]] = []
     failed: list[str] = []
 
@@ -65,6 +67,15 @@ def _check_deps() -> None:
     for pkg, status, state in rows:
         icon = {"ok": "✔", "installed": "↓", "failed": "✘"}.get(state, "?")
         print(f"  [{icon}] {pkg:<22} {status}")
+
+    # ── External tools ────────────────────────────────────────────────────────
+    print()
+    print("  External tools:")
+    katana_path = shutil.which("katana")
+    if katana_path:
+        print(f"  [✔] katana                 found ({katana_path})")
+    else:
+        print("  [i] katana                 not found — will auto-install on first recon")
     print()
 
     if failed:
