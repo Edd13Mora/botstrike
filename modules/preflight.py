@@ -357,24 +357,26 @@ def _run_wafw00f(target_url: str, timeout: int = 45,
 
     try:
         proc = _sub.run(
-            [wafw00f_path, target_url, "-a"],
+            [wafw00f_path, target_url],
             capture_output=True, text=True, timeout=timeout,
         )
         output = (proc.stdout or "") + (proc.stderr or "")
-        result["raw"] = output[:1500]
 
-        for line in output.splitlines():
-            m = _re.search(
-                r"is behind ([^(\n]+?)(?:\s*\([^)]+\))?\s+WAF",
-                line, _re.IGNORECASE,
-            )
+        # Strip ANSI escape codes — wafw00f colours its output
+        ansi_esc = _re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+        output_clean = ansi_esc.sub('', output)
+        result["raw"] = output_clean[:1500]
+
+        for line in output_clean.splitlines():
+            # Matches: "is behind Azure Front Door (Microsoft) WAF."
+            m = _re.search(r'is behind (.+?)\s+WAF', line, _re.IGNORECASE)
             if m:
-                waf_name = m.group(1).strip()
+                waf_name = m.group(1).strip().rstrip('.')
                 if waf_name and waf_name not in result["waf_names"]:
                     result["waf_names"].append(waf_name)
                     result["detected"] = True
 
-        if "no waf detected" in output.lower():
+        if "no waf detected" in output_clean.lower():
             result["detected"] = False
             result["waf_names"] = []
 
