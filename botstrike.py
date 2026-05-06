@@ -104,7 +104,8 @@ _interrupted = False
 
 
 def _save_partial_and_exit(sig, frame) -> None:
-    global _interrupted
+    global _interrupted, _session_data, _preflight_data, _goodbot_data, _openapi_data
+    global _endpoint_data, _recon_data, _scraping_data, _ddos_data, _report_dir, _logger
     _interrupted = True
     console.print("\n\n[bold yellow][!] Interrupted — saving partial report...[/bold yellow]")
 
@@ -112,8 +113,6 @@ def _save_partial_and_exit(sig, frame) -> None:
         _session_data["end_time"] = now_utc()
         _session_data["interrupted"] = True
         try:
-            global _session_data, _preflight_data, _goodbot_data, _openapi_data, _endpoint_data
-            global _recon_data, _scraping_data, _ddos_data, _report_dir, _logger
             json_path = reporter.build_json_report(
                 _session_data, _preflight_data, _recon_data,
                 _scraping_data, _ddos_data, _report_dir,
