@@ -360,24 +360,9 @@ def _install_katana(logger: Optional[logging.Logger] = None) -> bool:
     )
     log(f"  Katana not found — auto-install: distro={distro} arch={arch}", "info", logger)
 
-    # ── Method 1a: apt after update (Kali — katana is in Kali repos) ─────────
-    if distro == "kali" and shutil.which("apt"):
-        console.print("  [cyan]→[/cyan] Trying: sudo apt update && sudo apt install -y katana")
-        try:
-            subprocess.run(["sudo", "apt", "update", "-qq"], capture_output=True, timeout=60)
-            proc = subprocess.run(
-                ["sudo", "apt", "install", "-y", "katana"],
-                capture_output=True, text=True, timeout=120,
-            )
-            if proc.returncode == 0 and shutil.which("katana"):
-                console.print("  [bold green]✓ Installed via apt[/bold green]")
-                log("  Katana installed via apt", "success", logger)
-                return True
-            log(f"  apt failed (rc={proc.returncode}): {proc.stderr[:300]}", "warning", logger)
-        except Exception as e:
-            log(f"  apt install error: {e}", "warning", logger)
-
-    # ── Method 1b: ProjectDiscovery apt repo (Kali/Debian/Ubuntu) ────────────
+    # ── Method 1: ProjectDiscovery apt repo (Kali/Debian/Ubuntu) ────────────
+    # Note: katana is NOT in the standard Kali or Debian repos. Must use the
+    # ProjectDiscovery apt repo or download the binary directly.
     if shutil.which("apt") and shutil.which("curl"):
         console.print("  [cyan]→[/cyan] Trying: ProjectDiscovery apt repo")
         try:
