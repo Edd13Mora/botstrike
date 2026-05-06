@@ -376,30 +376,48 @@ def _install_katana(logger: Optional[logging.Logger] = None) -> bool:
         except Exception as e:
             log(f"  apt install error: {e}", "warning", logger)
 
-    # ── Method 2: go install (any distro with Go on PATH) ────────────────────
+    # ── Method 2: go install (any distro with Go >= 1.21 on PATH) ────────────
     if shutil.which("go"):
-        console.print("  [cyan]→[/cyan] Trying: go install katana@latest")
+        # Katana v1.6+ uses 'go 1.25.7' toolchain directive which requires
+        # the go command itself to be >= 1.21 to parse it. Older Go versions
+        # crash with "invalid go version: must match format 1.23".
+        # Check version before attempting, skip straight to binary download if too old.
+        _go_ok = False
         try:
-            gopath_proc = subprocess.run(
-                ["go", "env", "GOPATH"],
-                capture_output=True, text=True, timeout=10,
-            )
-            gopath = gopath_proc.stdout.strip() or os.path.expanduser("~/go")
-            env = {**os.environ, "PATH": os.environ.get("PATH", "") + f":{gopath}/bin"}
+            ver_proc = subprocess.run(["go", "version"], capture_output=True, text=True, timeout=5)
+            m = re.search(r"go(\d+)\.(\d+)", ver_proc.stdout)
+            if m and (int(m.group(1)), int(m.group(2))) >= (1, 21):
+                _go_ok = True
+            else:
+                ver_str = ver_proc.stdout.strip()
+                console.print(f"  [yellow]→ Go too old for katana@latest ({ver_str}) — skipping go install[/yellow]")
+                log(f"  go version too old ({ver_str}), skipping go install", "warning", logger)
+        except Exception:
+            pass
 
-            proc = subprocess.run(
-                ["go", "install", "github.com/projectdiscovery/katana/cmd/katana@latest"],
-                capture_output=True, text=True, timeout=180, env=env,
-            )
-            if proc.returncode == 0:
-                os.environ["PATH"] = env["PATH"]
-                if shutil.which("katana"):
-                    console.print("  [bold green]✓ Installed via go install[/bold green]")
-                    log("  Katana installed via go install", "success", logger)
-                    return True
-            log(f"  go install failed (rc={proc.returncode}): {proc.stderr[:300]}", "warning", logger)
-        except Exception as e:
-            log(f"  go install error: {e}", "warning", logger)
+        if _go_ok:
+            console.print("  [cyan]→[/cyan] Trying: go install katana@latest")
+            try:
+                gopath_proc = subprocess.run(
+                    ["go", "env", "GOPATH"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                gopath = gopath_proc.stdout.strip() or os.path.expanduser("~/go")
+                env = {**os.environ, "PATH": os.environ.get("PATH", "") + f":{gopath}/bin"}
+
+                proc = subprocess.run(
+                    ["go", "install", "github.com/projectdiscovery/katana/cmd/katana@latest"],
+                    capture_output=True, text=True, timeout=180, env=env,
+                )
+                if proc.returncode == 0:
+                    os.environ["PATH"] = env["PATH"]
+                    if shutil.which("katana"):
+                        console.print("  [bold green]✓ Installed via go install[/bold green]")
+                        log("  Katana installed via go install", "success", logger)
+                        return True
+                log(f"  go install failed (rc={proc.returncode}): {proc.stderr[:300]}", "warning", logger)
+            except Exception as e:
+                log(f"  go install error: {e}", "warning", logger)
 
     # ── Method 3: prebuilt binary from GitHub releases ────────────────────────
     console.print("  [cyan]→[/cyan] Trying: download prebuilt binary from GitHub releases")
