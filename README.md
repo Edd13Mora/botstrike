@@ -2,44 +2,25 @@
 
 **Bot Protection Effectiveness Tester**
 
-BotStrike is a modular, command-line tool built for security consultants running bot-protection comparison engagements — primarily **DataDome vs CrowdSec** side-by-side assessments. It simulates the full spectrum of bot behavior against a target web application: from patient, human-like scrapers to aggressive HTTP floods. Results are scored, graded A–F, and delivered as a standalone dark-themed HTML dashboard and a machine-readable JSON report.
+BotStrike is a command-line tool for security professionals. It attacks a website the same way real bots do — scraping, flooding, credential stuffing — and tells you how well the site's bot protection (DataDome, CrowdSec, Cloudflare, etc.) actually stops it. Results are scored A–F and saved as a full HTML dashboard + JSON report.
 
-> **Authorized use only.** BotStrike is for security professionals testing systems they own or have explicit written permission to test. The `--confirm-authorized` flag is a binding declaration of that authorization. Unauthorized use is illegal.
+> **Authorized use only.** Only test websites you own or have written permission to test. The `--confirm-authorized` flag is your legal declaration of that authorization.
 
 ---
 
 ## Table of Contents
 
 - [How It Works](#how-it-works)
-- [Architecture](#architecture)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Test Modules](#test-modules)
 - [CLI Reference](#cli-reference)
 - [Profile Presets](#profile-presets)
-- [Test Modules](#test-modules)
-  - [Module 0 — Pre-Flight Fingerprinting](#module-0--pre-flight-fingerprinting)
-  - [Module 1 — Passive Recon](#module-1--passive-recon)
-  - [Module 2A — Stealth Scraping](#module-2a--stealth-scraping)
-  - [Module 2B — Aggressive Scraping](#module-2b--aggressive-scraping)
-  - [Module 3 — Application-Layer Bot Flood](#module-3--application-layer-bot-flood)
 - [Protection Scoring](#protection-scoring)
 - [Recommendations Engine](#recommendations-engine)
 - [Reporting](#reporting)
 - [Compare Mode](#compare-mode)
-- [Distributed Mode](#distributed-mode)
-  - [How Distributed Mode Works](#how-distributed-mode-works)
-  - [Prerequisites](#prerequisites)
-  - [Step 1 — Generate a Dedicated SSH Key](#step-1--generate-a-dedicated-ssh-key)
-  - [Step 2 — Authorize the Key on Every VPS](#step-2--authorize-the-key-on-every-vps)
-  - [Step 3 — Create nodes.yaml](#step-3--create-nodesyaml)
-  - [Step 4 — Bootstrap the Fleet](#step-4--bootstrap-the-fleet)
-  - [Step 5 — Run a Distributed Test](#step-5--run-a-distributed-test)
-  - [Live Fleet Dashboard](#live-fleet-dashboard)
-  - [Distributed Output Structure](#distributed-output-structure)
-  - [Merged Report Format](#merged-report-format)
-  - [Distributed CLI Reference](#distributed-cli-reference)
-  - [Security Model](#security-model)
-  - [Troubleshooting](#troubleshooting)
+- [Distributed Mode — Run from Many VPS at Once](#distributed-mode--run-from-many-vps-at-once)
 - [Proxy Support](#proxy-support)
 - [Config File](#config-file)
 - [Project Structure](#project-structure)
@@ -50,99 +31,42 @@ BotStrike is a modular, command-line tool built for security consultants running
 
 ## How It Works
 
-BotStrike runs four sequential phases against a single target URL (or two targets in compare mode):
+BotStrike runs 4 phases against your target, one after another:
 
 ```
-Phase 0 · Pre-Flight      DNS check → WAF fingerprint → 8 probe requests
-Phase 1 · Recon           robots.txt + sitemap.xml crawl → URL discovery
-Phase 2 · Scraping        Stealth mode (human-like) → Aggressive mode (naked bots)
-Phase 3 · Bot Flood       4 attack vectors with live metrics (requires --confirm-authorized)
-           └─ HTTP Flood · Slowloris · POST Flood · Cache Buster
+Phase 0 · Pre-Flight      Checks what WAF / CDN is protecting the site
+Phase 1 · Recon           Reads robots.txt and sitemap to find pages to attack
+Phase 2 · Scraping        Sends stealth bots (human-like) then obvious bots
+Phase 3 · Bot Flood       4 attack types: HTTP flood, Slowloris, POST flood, Cache buster
 ```
 
-At the end, collected data flows through a **scoring engine** (0–100, grade A–F) and a **recommendations engine** (CRITICAL → LOW), then everything is rendered into HTML and JSON reports saved to `reports/<hostname>_<date>_<time>/`.
+After all phases finish, BotStrike:
+- Scores the protection 0–100 and gives it a grade (A = excellent, F = no protection)
+- Lists specific things the site should fix, in priority order (CRITICAL → LOW)
+- Saves an HTML dashboard and a JSON report to your `reports/` folder
 
-CTRL+C at any point triggers a **graceful interrupt**: partial data collected so far is immediately saved to a report before the process exits.
-
----
-
-## Architecture
-
-```
-botstrike/
-├── botstrike.py            Entry point — CLI parsing, orchestration, CTRL+C handler
-├── config.yaml             Default configuration (overridden by CLI flags)
-├── nodes.yaml.example      Fleet config template for distributed mode
-├── wordlists/
-│   └── useragents.txt      200+ real browser UA strings (Chrome, Firefox, Safari, Edge, mobile)
-├── modules/
-│   ├── utils.py            Shared utilities: UA pool, stealth headers, response classifier, proxy
-│   ├── preflight.py        WAF/CDN fingerprinting + 8 probe payloads
-│   ├── recon.py            robots.txt + sitemap.xml parser + homepage link extractor
-│   ├── scraper.py          Stealth and aggressive scraping + product data extraction
-│   ├── ddos.py             4-vector bot flood engine with live Rich dashboard
-│   ├── reporter.py         Scoring, recommendations, JSON + HTML report generation
-│   └── distributor.py      SSH orchestration engine for distributed fleet execution
-└── templates/
-    ├── report.html.j2      Per-target HTML report (dark theme, Chart.js)
-    └── comparison.html.j2  Side-by-side comparison report
-```
-
-**Data flow (single target):**
-
-```
-botstrike.py
-    │
-    ├─ run_one_target(url, args, cfg)
-    │       │
-    │       ├─ preflight.run()     → preflight_data dict
-    │       ├─ recon.run()         → recon_data dict + all_discovered_urls
-    │       ├─ scraper.run_stealth()   → scraping_data["stealth"]
-    │       ├─ scraper.run_aggressive() → scraping_data["aggressive"]
-    │       ├─ ddos.run()          → ddos_data dict (4 vector results)
-    │       │
-    │       ├─ reporter.calculate_protection_score()
-    │       ├─ reporter.generate_recommendations()
-    │       ├─ reporter.load_previous_report()   (historical delta)
-    │       ├─ reporter.compute_deltas()
-    │       ├─ reporter.build_json_report()
-    │       └─ reporter.build_html_report()
-    │
-    ├─ [compare mode]      reporter.build_comparison_html(result_a, result_b)
-    │
-    └─ [distributed mode]  distributor.run_distributed(url, args, cfg)
-                               │
-                               ├─ [thread: node-sg-01]  SSH → upload → run → download
-                               ├─ [thread: node-fr-01]  SSH → upload → run → download
-                               └─ [thread: node-us-01]  SSH → upload → run → download
-                                       ↓ all complete
-                               distributor.merge_results() → merged_report.json
-```
+Press `CTRL+C` at any time — BotStrike will save whatever it has collected so far.
 
 ---
 
 ## Installation
 
-**Requirements:** Python ≥ 3.9 — tested on Python 3.14.
+**You need:** Python 3.9 or newer.
 
 ```bash
-git clone https://github.com/yourorg/botstrike.git
+git clone https://github.com/Edd13Mora/botstrike.git
 cd botstrike
 pip install -r requirements.txt
 ```
 
-BotStrike will also **auto-install** any missing dependency at runtime before the first import, printing a dependency status table on first run.
-
-### Kali Linux (recommended platform)
-
+**On Kali Linux:**
 ```bash
 sudo apt update && sudo apt install python3-pip -y
 pip3 install -r requirements.txt
 python3 botstrike.py --help
 ```
 
-### Windows
-
+**On Windows:**
 ```powershell
 pip install -r requirements.txt
 python botstrike.py --help
@@ -153,120 +77,21 @@ python botstrike.py --help
 ## Quick Start
 
 ```bash
-# Scraping only — no authorization flag needed
+# Just scraping — no authorization needed
 python botstrike.py --url https://shop.example.com --mode scrape
 
-# Full test with bot flood — requires written authorization
+# Full test including bot flood — you must have written authorization
 python botstrike.py --url https://shop.example.com --mode full --confirm-authorized
 
-# Non-interactive full test (CI / scripted runs)
-python botstrike.py --url https://shop.example.com \
-    --mode full --confirm-authorized --yes \
-    --operator "j.doe@company.com"
-
-# DataDome vs CrowdSec side-by-side comparison
+# Compare DataDome vs CrowdSec side by side
 python botstrike.py --compare \
     --url-a https://site-with-datadome.com --label-a "DataDome" \
     --url-b https://site-with-crowdsec.com --label-b "CrowdSec" \
     --mode full --confirm-authorized
 
-# ── Distributed mode (multi-VPS fleet) ──────────────────────────────────────
-
-# First time: bootstrap all nodes (upload + install deps)
-python botstrike.py --setup-nodes
-
-# Distributed scraping across all nodes simultaneously
-python botstrike.py --url https://shop.example.com --mode scrape --distributed
-
-# Distributed full test (each node from its own IP)
-python botstrike.py --url https://shop.example.com \
-    --mode full --confirm-authorized --distributed
-
-# Distributed full test, custom nodes file, heavy profile
-python botstrike.py --url https://shop.example.com \
-    --mode full --confirm-authorized --distributed \
-    --nodes /path/to/my_nodes.yaml --profile heavy
+# Run from 3 VPS servers at once (see Distributed Mode section below)
+python botstrike.py --url https://shop.example.com --mode full --confirm-authorized --distributed
 ```
-
----
-
-## CLI Reference
-
-```
-python botstrike.py [OPTIONS]
-```
-
-### target
-
-| Flag | Type | Description |
-|---|---|---|
-| `--url URL` | string | Full target URL including scheme. Required unless using `--compare`. |
-
-### test control
-
-| Flag | Default | Description |
-|---|---|---|
-| `--mode MODE` | `full` | `scrape` — recon + scraping only. `ddos` — recon + bot flood only. `full` — all phases end-to-end. |
-| `--confirm-authorized` | off | **Safety gate.** Required to unlock the bot flood module. Declares you hold written authorization from the target owner. Without this flag, `--mode ddos` exits and `--mode full` silently falls back to scrape-only. |
-| `--yes` | off | Skip all interactive confirmation prompts. Useful for CI/CD pipelines and scripted engagements. |
-
-### ddos tuning
-
-| Flag | Default | Description |
-|---|---|---|
-| `--rps N` | `100` | Target requests-per-second for the HTTP Flood vector. Ramps from 0 to N over the first 30 seconds (configurable via `config.yaml`), then sustains. |
-| `--duration SECONDS` | `60` | How long each bot flood vector runs. Applies equally to all 4 vectors. Use `30` for a quick check, `120+` for sustained pressure. |
-| `--connections N` | `200` | Number of concurrent TCP connections for the Slowloris vector. Each holds its socket open by sending a partial header every 10 seconds. |
-
-### output & metadata
-
-| Flag | Default | Description |
-|---|---|---|
-| `--operator NAME` | `""` | Operator identifier embedded in the report (name or email). Appears in the JSON envelope, HTML footer, and log file for accountability. |
-| `--config FILE` | `config.yaml` | Path to a YAML configuration file. CLI flags always take precedence over config file values. |
-
-### behaviour presets
-
-| Flag | Default | Description |
-|---|---|---|
-| `--profile PROFILE` | `medium` | Named configuration bundle: `light`, `medium`, `heavy`, or `stealth`. See [Profile Presets](#profile-presets) for exact values. |
-| `--proxy URL` | none | Route all HTTP traffic through this proxy. Supports HTTP and SOCKS5. Applied to every module: preflight, recon, scraping, and bot flood. |
-
-### compare mode
-
-| Flag | Default | Description |
-|---|---|---|
-| `--compare` | off | Enable compare mode. Requires `--url-a` and `--url-b`. Generates individual reports per target plus a unified side-by-side comparison dashboard. |
-| `--url-a URL` | — | First target URL (e.g. the DataDome-protected site). |
-| `--url-b URL` | — | Second target URL (e.g. the CrowdSec-protected site). |
-| `--label-a NAME` | `Target A` | Human-readable label for Target A in the comparison report. |
-| `--label-b NAME` | `Target B` | Human-readable label for Target B in the comparison report. |
-
-### distributed mode
-
-| Flag | Default | Description |
-|---|---|---|
-| `--distributed` | off | Run BotStrike simultaneously across all nodes in `--nodes`. Each node sends traffic from its own IP. Results are merged locally into a fleet report. |
-| `--nodes FILE` | `nodes.yaml` | Path to the fleet config YAML. See [Step 3 — Create nodes.yaml](#step-3--create-nodesyaml) for format. |
-| `--setup-nodes` | off | Bootstrap mode — connect to all nodes, upload BotStrike, install dependencies, run smoke test, then exit. No `--url` needed. Run this once before the first engagement. |
-
----
-
-## Profile Presets
-
-Presets are named configuration bundles. Any explicit CLI flag (`--rps`, `--duration`, `--connections`) overrides the preset value.
-
-| Preset | Stealth threads | Stealth delay | Aggressive threads | Max pages | RPS | Duration | Slowloris |
-|---|---|---|---|---|---|---|---|
-| `light` | 2 | 2.5–6.0 s | 4 | 30 / 50 | 30 | 30 s | 50 |
-| `medium` *(default)* | 3 | 1.5–4.0 s | 10 | 100 / 200 | 100 | 60 s | 200 |
-| `heavy` | 5 | 1.0–2.5 s | 20 | 300 / 500 | 300 | 120 s | 500 |
-| `stealth` | 1 | 5.0–12.0 s | 1 | 50 / 20 | 10 | 30 s | 20 |
-
-- **light** — Quick reconnaissance pass. Minimal noise. Good for a first look.
-- **medium** — Balanced defaults suitable for most engagements.
-- **heavy** — Sustained pressure. Use when you need to confirm rate-limit thresholds or measure degradation under load.
-- **stealth** — Maximum evasion. Single thread, long inter-request delays, minimal volume. Designed to mimic a patient human scraper and defeat behavioral detection that relies on velocity.
 
 ---
 
@@ -274,374 +99,321 @@ Presets are named configuration bundles. Any explicit CLI flag (`--rps`, `--dura
 
 ### Module 0 — Pre-Flight Fingerprinting
 
-**File:** `modules/preflight.py`
+Runs before anything else. Figures out what is protecting the target.
 
-The pre-flight phase runs before anything else. It tells you what is protecting the target before BotStrike starts making noise.
+1. Checks that the domain resolves (exits if it does not)
+2. Sends a normal request to confirm the site is live
+3. Reads response headers to detect the CDN (Cloudflare, Akamai, Fastly, etc.)
+4. Reads `Server` / `X-Powered-By` headers to detect the tech stack
+5. Checks for HTTPS and HSTS
+6. Looks for rate-limit headers (`X-RateLimit-Limit`, `Retry-After`)
+7. Checks for `robots.txt` and `sitemap.xml`
+8. Sends 8 crafted "attack" requests to see if the WAF reacts
 
-**Steps:**
+**The 8 WAF probe requests:**
 
-1. **DNS resolution** — Confirms the hostname resolves. Exits early if it does not.
-2. **Liveness check** — Sends a HEAD request with stealth headers to confirm the target responds.
-3. **CDN detection** — Inspects response headers against signatures for 7 CDN providers.
-4. **Tech stack detection** — Reads `Server`, `X-Powered-By`, and `X-Generator` headers.
-5. **HTTPS / HSTS check** — Confirms scheme and checks for `Strict-Transport-Security`.
-6. **Rate-limit header detection** — Looks for `X-RateLimit-Limit`, `Retry-After`, `RateLimit-Reset`.
-7. **robots.txt / sitemap.xml** — Checks existence (200 OK) of both files.
-8. **8 WAF probe requests** — Sends crafted requests that any WAF should react to.
-
-**WAF probes:**
-
-| Probe | Technique | What it tests |
+| Probe | What it sends | What it tests |
 |---|---|---|
-| SQLi Probe | `?id=1' OR '1'='1` | Query string injection — triggers rule-based WAFs |
-| XSS UA Probe | `User-Agent: <script>alert(1)</script>` | Header inspection depth |
-| Path Traversal | `/../../../etc/passwd` | Directory traversal signature |
-| XFF Spoof | `X-Forwarded-For: 127.0.0.1` | Localhost IP bypass via proxy header |
-| Empty User-Agent | `User-Agent: (empty)` | Strong bot signal for DataDome and CrowdSec |
-| Known Bot UA | `User-Agent: python-requests/2.31.0` | Most basic bot tell — both DD and CS block this |
-| Scanner UA | `User-Agent: Nikto/2.1.6` on `/wp-admin/` | Security scanner UA + admin path double trigger |
-| Header Injection | `X-Custom-IP-Authorization: 127.0.0.1` | Internal IP bypass via custom header |
+| SQLi | `?id=1' OR '1'='1` | SQL injection detection |
+| XSS User-Agent | `<script>alert(1)</script>` in UA | Header scanning depth |
+| Path Traversal | `/../../../etc/passwd` | Directory traversal signatures |
+| XFF Spoof | `X-Forwarded-For: 127.0.0.1` | Localhost bypass via proxy header |
+| Empty UA | *(blank User-Agent)* | Most WAFs block empty UAs immediately |
+| Bot UA | `python-requests/2.31.0` | Basic bot detection |
+| Scanner UA | `Nikto/2.1.6` on `/wp-admin/` | Scanner detection |
+| Header Injection | `X-Custom-IP-Authorization: 127.0.0.1` | Internal IP bypass |
 
 **WAF detection covers 13 vendors:**
+DataDome · CrowdSec · Cloudflare · PerimeterX · Akamai · AWS WAF · Imperva · F5 BIG-IP · ModSecurity · Sucuri · Radware · Reblaze · Barracuda
 
-DataDome · CrowdSec · Cloudflare · PerimeterX · Akamai Bot Manager · AWS WAF · Imperva/Incapsula · F5 BIG-IP ASM · ModSecurity · Sucuri · Radware AppWall · Reblaze · Barracuda WAF
-
-Detection uses three signal sources combined across all probe responses:
-- **Response headers** — vendor-specific header names (e.g. `x-datadome`, `cf-ray`, `x-px-block-score`)
-- **Response body keywords** — text patterns in block pages (e.g. `datadome.co`, `cloudflare`, `incapsula`)
-- **Set-Cookie headers** — vendor cookies (e.g. `datadome`, `__cf_bm`, `incap_ses`, `_px`)
-
-**Blocking mode detection:** If any probe returns a `403`, `406`, `429`, or `503`, the WAF is flagged as `ACTIVE`. Otherwise it is flagged `PASSIVE (detection-only)` — a critical finding because the WAF is watching but not stopping anything.
+If any probe gets a 403, 429, or 503 → WAF is `ACTIVE (blocking)`.
+If probes all get 200 → WAF is `PASSIVE (detection-only)` — a critical finding.
 
 ---
 
 ### Module 1 — Passive Recon
 
-**File:** `modules/recon.py`
+Discovers pages to use in the scraping and flood phases.
 
-Discovers URLs to feed into the scraping and bot flood phases.
-
-- Fetches and parses `robots.txt` to extract `Allow` and `Disallow` paths.
-- Fetches and parses `sitemap.xml` (and nested sitemaps) to extract all `<loc>` URLs.
-- Crawls the homepage and extracts all `<a href>` links.
-- Deduplicates, normalizes, and filters all discovered URLs to the same hostname.
-- Returns `all_discovered_urls` — the master URL list passed to scraping and bot flood.
+- Reads `robots.txt` — extracts all Allow/Disallow paths
+- Reads `sitemap.xml` — extracts every `<loc>` URL (including nested sitemaps)
+- Crawls the homepage — extracts all `<a href>` links
+- Deduplicates everything and filters to the same domain
 
 ---
 
 ### Module 2A — Stealth Scraping
 
-**File:** `modules/scraper.py` → `run_stealth()`
+Simulates a patient, human-like bot. This is the hardest type to detect because it looks like real browsing.
 
-Simulates a patient, human-like bot. This is the hardest bot type for behavioral detection to catch because it mimics legitimate browsing patterns.
+**How it evades detection:**
+- Picks from 200+ real browser User-Agent strings (Chrome, Firefox, Safari, Edge, mobile)
+- Matches `Sec-CH-UA` headers to the chosen UA (a Chrome UA without the right `Sec-CH-UA` is a dead giveaway)
+- Sends realistic headers: `Accept`, `Accept-Language`, `Referer` (from Google/Bing), `DNT`
+- Randomizes header order (bot detectors fingerprint header order, not just values)
+- Waits 1.5–4 seconds between requests (configurable)
+- Uses a persistent session with cookies across requests
 
-**Evasion techniques:**
-
-- **User-Agent rotation** — randomly selects from 200+ real browser UA strings (Chrome, Firefox, Safari, Edge on Windows/Mac/Linux, plus iOS and Android mobile UAs).
-- **`Sec-CH-UA` fingerprint consistency** — if a Chrome or Edge UA is selected, the matching `Sec-CH-UA`, `Sec-CH-UA-Mobile`, and `Sec-CH-UA-Platform` headers are injected. Firefox and Safari intentionally omit these headers (matching real browser behavior). A Chrome 124 UA without a matching `sec-ch-ua` is a strong bot signal to DataDome.
-- **Realistic header set** — includes `Accept`, `Accept-Language`, `Accept-Encoding`, `Referer` (from a pool of search engine URLs), `DNT`, `Upgrade-Insecure-Requests`.
-- **Randomized header order** — modern bot detectors fingerprint the order of request headers in addition to their values.
-- **Random inter-request delay** — configurable `delay_min` to `delay_max` seconds (default 1.5–4.0 s).
-- **Session persistence** — uses a `requests.Session` with cookie jar so session cookies from page 1 are sent on page 2.
-- **Throttled thread pool** — defaults to 3 concurrent threads so the request pattern looks more like 3 tabs open rather than a flood.
-
-**Product data extraction:** For every 200 OK HTML response, the scraper attempts to extract structured product data using CSS selectors:
-- Name: `h1`, `[itemprop=name]`, `[class*=product-title]`
-- Price: `[itemprop=price]`, `[class*=price]`, `.price`
-- Description: `[itemprop=description]`, `[class*=description]`
-- Images: `<img>` with `src` containing "product", "item", or "catalog"
-
-Extracted items appear in the report to demonstrate what a scraper actually harvests. XML documents (sitemaps, feeds) are automatically excluded from product extraction.
-
-**Result dict includes:** `total_requests`, `blocked_pct`, `items_extracted`, `pages_crawled`, `duration_s`, `responses` (code breakdown), `sample_items` (up to 20 extracted products), `raw_results`.
+For every HTML page it visits, it also tries to extract product data:
+- Name, price, description, images
 
 ---
 
 ### Module 2B — Aggressive Scraping
 
-**File:** `modules/scraper.py` → `run_aggressive()`
+Simulates a naive, obvious bot — no delays, no session, minimal headers, raw speed. Any WAF should block these immediately. If it does not, that is a HIGH finding.
 
-Simulates an unsophisticated bot — the kind a script kiddie or a naive API consumer would write. No delays, no session, no realistic headers. Any WAF worth deploying should block these immediately.
-
-- **No inter-request delays** — fires as fast as the thread pool allows.
-- **No session** — fresh connection each request, no cookies.
-- **Minimal headers** — just a rotating UA from the pool; no `Accept-Language`, no `Referer`, no `Sec-CH-UA`.
-- **Path guessing** — appends a list of common API and content paths to the discovered URL list:
-  `/api/products`, `/api/catalog`, `/api/prices`, `/api/items`, `/api/v1/products`, `/api/v2/catalog`, `/search?q=*`, `/search?query=test`, `/products`, `/catalog`, `/shop`, `/store`
-- **Higher thread count** — defaults to 10 concurrent threads.
-
-If `aggressive_blocked_pct` is low (below 50%), it means the WAF is not blocking even the most obvious bot signatures, which scores as a HIGH severity finding.
+Also tries common API paths: `/api/products`, `/api/catalog`, `/api/prices`, `/search?q=*`, etc.
 
 ---
 
 ### Module 3 — Application-Layer Bot Flood
 
-**File:** `modules/ddos.py`
+**Requires `--confirm-authorized`**
 
-**Requires:** `--confirm-authorized`
+Runs 4 attack vectors in sequence. A live terminal dashboard updates every 500ms.
 
-Runs 4 distinct attack vectors sequentially, with a configurable pause between each. A live Rich terminal dashboard updates every 500ms showing real-time RPS, latency percentiles, and response code breakdown.
-
-> **Scope note:** These vectors simulate single-source, application-layer (L7) bot floods from one IP address. They measure per-IP rate limiting effectiveness, detection latency, and application resilience under load. They are **not** representative of volumetric distributed DDoS (L3/L4 from a botnet). For client-facing reports, this module is accurately described as "Application-Layer Bot Flood Stress Test."
+> These are single-source L7 floods — they test per-IP rate limiting and detection speed. They are not the same as a distributed DDoS from a botnet. For client reports, describe this as "Application-Layer Bot Flood Stress Test."
 
 #### Vector 1 — HTTP Flood
-
-High-volume GET flood with a ramp-up phase. Worker threads are distributed across target URL, product URLs, and search URLs discovered during recon. Each worker applies a linear ramp from 0 to the target RPS over `ramp_up_seconds` to avoid an instant spike that would look nothing like real attack patterns.
+High-volume GET flood. Ramps from 0 to target RPS over 30 seconds, then sustains. Spreads across all discovered URLs.
 
 #### Vector 2 — Slowloris
-
-Opens many simultaneous TCP connections (default 200) and sends a partial HTTP request on each — just enough headers to keep the server's socket open, but never completing the request. Every 10 seconds each connection sends another junk header to reset the server's idle timeout. The goal is to exhaust the server's connection pool without sending much data. SSL/TLS is handled transparently (`ssl.create_default_context()`).
+Opens many TCP connections (default 200) and keeps each one alive by sending incomplete requests — never finishing them. Goal: exhaust the server's connection pool without much bandwidth.
 
 #### Vector 3 — POST Flood
-
-Sends random POST payloads (128–4096 bytes of random ASCII) to form submission endpoints: `/checkout`, `/cart`, `/search`, `/login`, `/account`, and any equivalents discovered in recon. Targets state-creating endpoints that are typically more expensive for the server to process than GET requests.
+Sends random POST data to form endpoints: `/checkout`, `/cart`, `/login`, `/search`, etc. POST requests are more expensive for the server to process than GETs.
 
 #### Vector 4 — Cache Buster
+Adds a unique query string (`?cb=<uuid>&ts=<ms>`) to every request so CDN caches cannot serve cached responses. Every request hits the origin server.
 
-Appends unique query strings (`cb=<uuid>&ts=<millisecond-timestamp>`) to every request, preventing CDN and reverse proxy caches from serving cached responses. Forces every request to hit the origin server. Targets all discovered URLs simultaneously.
+**Metrics collected per vector:** total requests, avg/peak RPS, latency p50/p95/p99/peak, blocked%, full response code breakdown.
 
-**Per-vector metrics collected:**
+---
 
-| Metric | Description |
+## CLI Reference
+
+### Target
+
+| Flag | Description |
 |---|---|
-| `total_requests` | Total HTTP requests sent |
-| `rps_avg` | Average requests per second (from 1-second sampling windows) |
-| `rps_peak` | Highest 1-second RPS observed |
-| `latency_avg_ms` | Mean response latency |
-| `latency_p50_ms` | Median latency |
-| `latency_p95_ms` | 95th percentile latency |
-| `latency_p99_ms` | 99th percentile latency |
-| `latency_peak_ms` | Worst single response latency |
-| `blocked_pct` | % of responses that were 403, 429, or 503 |
-| `responses` | Full code breakdown: 200 / 403 / 429 / 503 / error |
+| `--url URL` | The site to test. Include the scheme: `https://shop.example.com` |
+
+### Test Control
+
+| Flag | Default | Description |
+|---|---|---|
+| `--mode MODE` | `full` | `scrape` — recon + scraping only. `ddos` — recon + flood only. `full` — everything. |
+| `--confirm-authorized` | off | Required to unlock the bot flood. Declares you have written authorization. |
+| `--yes` | off | Skip all confirmation prompts. For CI/scripted runs. |
+
+### DDoS Tuning
+
+| Flag | Default | Description |
+|---|---|---|
+| `--rps N` | `100` | Target requests/second for the HTTP flood. |
+| `--duration SECONDS` | `60` | How long each flood vector runs. |
+| `--connections N` | `200` | Concurrent TCP connections for Slowloris. |
+
+### Output & Metadata
+
+| Flag | Default | Description |
+|---|---|---|
+| `--operator NAME` | — | Your name or email — embedded in the report for accountability. |
+| `--config FILE` | `config.yaml` | Path to a custom config file. |
+
+### Behaviour Presets
+
+| Flag | Default | Description |
+|---|---|---|
+| `--profile PROFILE` | `medium` | `light`, `medium`, `heavy`, or `stealth`. See Profile Presets below. |
+| `--proxy URL` | — | Route all traffic through a proxy. HTTP or SOCKS5. |
+
+### Compare Mode
+
+| Flag | Description |
+|---|---|
+| `--compare` | Enable side-by-side comparison of two targets. |
+| `--url-a URL` | First target URL. |
+| `--url-b URL` | Second target URL. |
+| `--label-a NAME` | Label for Target A in the report (e.g. "DataDome"). |
+| `--label-b NAME` | Label for Target B in the report (e.g. "CrowdSec"). |
+
+### Distributed Mode
+
+| Flag | Default | Description |
+|---|---|---|
+| `--distributed` | off | Run across all VPS nodes in `nodes.yaml` simultaneously. |
+| `--nodes FILE` | `nodes.yaml` | Path to your fleet config file. |
+| `--setup-nodes` | off | First-time setup: connects to all nodes, uploads BotStrike, installs dependencies. |
+
+---
+
+## Profile Presets
+
+| Preset | Stealth threads | Delay between requests | Aggressive threads | RPS | Duration | Slowloris |
+|---|---|---|---|---|---|---|
+| `light` | 2 | 2.5–6.0 s | 4 | 30 | 30 s | 50 |
+| `medium` *(default)* | 3 | 1.5–4.0 s | 10 | 100 | 60 s | 200 |
+| `heavy` | 5 | 1.0–2.5 s | 20 | 300 | 120 s | 500 |
+| `stealth` | 1 | 5.0–12.0 s | 1 | 10 | 30 s | 20 |
+
+Any explicit CLI flag (`--rps`, `--duration`, `--connections`) overrides the preset.
 
 ---
 
 ## Protection Scoring
 
-**File:** `modules/reporter.py` → `calculate_protection_score()`
+BotStrike starts at 100 and subtracts points for each problem it finds:
 
-Every engagement produces a single 0–100 numeric score and an A–F letter grade. The score starts at 100 and deductions are applied per finding.
-
-| Finding | Deduction | Severity |
+| Finding | Points lost | Severity |
 |---|---|---|
 | No WAF detected | −35 | CRITICAL |
-| WAF in passive/detection-only mode | −20 | HIGH |
-| Stealth scraping < 20% blocked | −20 | HIGH |
-| Stealth scraping 20–49% blocked | −10 | MEDIUM |
-| Aggressive bots < 50% blocked | −15 | HIGH |
-| Aggressive bots 50–79% blocked | −5 | LOW |
-| Each bot flood vector < 30% blocked | −5 | MEDIUM |
+| WAF is passive (detecting but not blocking) | −20 | HIGH |
+| Stealth bots blocked less than 20% of the time | −20 | HIGH |
+| Stealth bots blocked 20–49% of the time | −10 | MEDIUM |
+| Obvious bots blocked less than 50% of the time | −15 | HIGH |
+| Obvious bots blocked 50–79% of the time | −5 | LOW |
+| Each flood vector blocked less than 30% | −5 | MEDIUM |
 | No CDN detected | −5 | LOW |
 | HSTS header missing | −5 | LOW |
 
-**Grade bands:**
+**Grades:**
 
 | Grade | Score |
 |---|---|
-| A | ≥ 90 |
-| B | ≥ 80 |
-| C | ≥ 65 |
-| D | ≥ 50 |
-| F | < 50 |
+| A | 90–100 |
+| B | 80–89 |
+| C | 65–79 |
+| D | 50–64 |
+| F | below 50 |
 
 ---
 
 ## Recommendations Engine
 
-**File:** `modules/reporter.py` → `generate_recommendations()`
+After scoring, BotStrike generates a prioritized list of things to fix. Each recommendation includes:
+- Priority: CRITICAL / HIGH / MEDIUM / LOW
+- Title
+- Detailed description with product-specific guidance for DataDome and CrowdSec
 
-Generates prioritized, actionable remediation recommendations. All recommendations are context-aware for DataDome and CrowdSec deployments. Each recommendation includes a `priority` (CRITICAL / HIGH / MEDIUM / LOW), a `title`, and a detailed `description` with product-specific guidance.
-
-**Examples:**
-
-- *CRITICAL* — "Deploy a Bot Management Solution" — recommends DataDome (JS tag + server-side module) or CrowdSec (community blocklists + bouncer) with rationale.
-- *CRITICAL* — "Switch DataDome from Detection-Only to Blocking Mode" — flags that the WAF is logging but not stopping requests.
-- *HIGH* — "Improve Human-Like Bot Detection" — DataDome: enable device fingerprinting + JS challenge. CrowdSec: add appsec-collection behavioral scenarios.
-- *HIGH* — "Tighten Obvious Bot Detection Rules" — notes that `python-requests/2.31.0` UA should be blocked by default; references `http-bad-user-agents` scenario for CrowdSec.
-- *MEDIUM* — "Strengthen Rate Limiting — Http Flood" — references rate-limiting policy dashboard (DataDome) and `http-crawl-non_statics` / `http-flood` scenarios (CrowdSec).
-- *MEDIUM* — "Add a CDN Layer for DDoS Absorption" — notes DataDome and CrowdSec both offer edge modules for Cloudflare, Akamai, Fastly.
-- *LOW* — "Enable HSTS" — includes the exact header value and compliance framework references (PCI-DSS, GDPR).
-
-Recommendations are sorted CRITICAL → HIGH → MEDIUM → LOW and rendered as priority-colored cards in the HTML report.
+Recommendations are sorted from most critical to least, and displayed as color-coded cards in the HTML report.
 
 ---
 
 ## Reporting
 
-**Files:** `modules/reporter.py`, `templates/report.html.j2`, `templates/comparison.html.j2`
+Reports are saved to `reports/<hostname>_<date>_<time>/` after every run.
 
-All reports are written to `reports/<hostname>_<YYYYMMDD>_<HHMMSS>/`.
+### JSON Report (`botstrike_<id>.json`)
+Machine-readable full output. Contains every metric from every phase, the score, all recommendations, and historical deltas.
 
-### JSON Report
+### HTML Report (`botstrike_<id>.html`)
+Standalone dark-themed dashboard — open it in any browser, no internet required. Sections:
+- Protection score hero (grade circle, numeric score, deductions)
+- Historical delta (▲/▼ vs your previous run on the same site)
+- WAF fingerprint results and probe table
+- Recommendations cards (color-coded by priority)
+- Scraping results with charts and extracted product samples
+- Bot flood results with latency percentiles and RPS charts
 
-`botstrike_<sessionid>.json` — Machine-readable full output. Top-level structure:
-
-```json
-{
-  "session":         { "id", "target", "label", "operator", "tool_version", "start_time", "end_time", "mode", "authorized", "interrupted" },
-  "preflight":       { "waf_detected", "waf_match_reason", "waf_notes", "blocking_mode", "cdn_detected", "tech_stack", "hsts", "probe_results", ... },
-  "recon":           { "robots_allowed", "robots_disallowed", "sitemap_urls", "homepage_links", "all_discovered_urls" },
-  "scraping": {
-    "stealth":       { "total_requests", "blocked_pct", "items_extracted", "sample_items", "responses", "raw_results", ... },
-    "aggressive":    { ... }
-  },
-  "ddos": {
-    "http_flood":    { "vector", "total_requests", "rps_avg", "rps_peak", "latency_p50_ms", "latency_p95_ms", "latency_p99_ms", "blocked_pct", "responses" },
-    "slowloris":     { ... },
-    "post_flood":    { ... },
-    "cache_buster":  { ... }
-  },
-  "score":           { "score", "grade", "findings" },
-  "recommendations": [ { "priority", "title", "detail" }, ... ],
-  "deltas":          { "stealth_blocked_pct_delta", "aggressive_blocked_pct_delta", "score_delta" }
-}
-```
-
-### HTML Report
-
-`botstrike_<sessionid>.html` — Standalone dark-themed dashboard. Self-contained (no external dependencies at render time, CDN links embedded). Sections:
-
-- **Protection Score hero** — grade circle, numeric score, deduction summary pills
-- **Historical delta indicators** — ▲/▼ vs. the previous run on the same hostname
-- **Pre-flight fingerprint** — WAF vendor, blocking mode, CDN, tech stack, HSTS, probe results table with block type column
-- **Recommendations** — priority-colored cards (red/orange/yellow/blue)
-- **Scraping results** — donut chart (response code breakdown), items extracted, sample products table, block type breakdown (HARD_BLOCK / CAPTCHA_CHALLENGE / RATE_LIMIT / SOFT_REDIRECT / PASSED)
-- **Bot flood results** — per-vector cards with RPS, latency percentiles (p50/p95/p99), stacked area chart over time
-- **Raw log** — full request-level detail
-
-### Log File
-
-`botstrike_<sessionid>.log` — Timestamped plain-text log of all operations for audit trail.
+### Log File (`botstrike_<id>.log`)
+Plain-text audit trail of every operation with timestamps.
 
 ### Historical Deltas
-
-Before writing the report, BotStrike scans the `reports/` directory for previous JSON reports with the same hostname. If found, it computes:
-
-- `stealth_blocked_pct_delta` — improvement or regression in stealth bot detection
-- `aggressive_blocked_pct_delta` — improvement or regression in obvious bot detection
-- `score_delta` — overall protection score change
-
-Deltas are displayed as ▲ (improvement) or ▼ (regression) on the KPI cards in the HTML report.
+If you have run BotStrike against the same site before, the new report shows `▲ improved` or `▼ regressed` compared to the previous run — useful for tracking remediation progress over time.
 
 ---
 
 ## Compare Mode
 
-Compare mode runs the full pipeline against two targets and generates three reports:
+Runs the full pipeline against two sites and generates three reports:
+1. Individual report for Site A
+2. Individual report for Site B
+3. A side-by-side comparison dashboard
 
-1. **Individual report for Target A** (e.g. DataDome site)
-2. **Individual report for Target B** (e.g. CrowdSec site)
-3. **Unified comparison dashboard** (`comparison.html`) in `reports/compare_<timestamp>/`
-
-The comparison dashboard shows:
-- **Winner verdict** — automatically determined by score difference
-- **Side-by-side KPI grid** — score, grade, WAF vendor, blocking mode, CDN, HSTS, stealth blocked%, aggressive blocked%, items extracted
-- **▲/▼ winner indicators** per metric
-- **Scraping bar charts** — blocked% and items extracted for A vs B
-- **Bot flood charts** — blocked% and average latency by vector for A vs B
-- **Recommendations** — side-by-side, A on the left (blue), B on the right (green)
+The comparison dashboard shows: winner verdict, KPI grid with ▲/▼ indicators, scraping charts, flood charts, and recommendations side by side.
 
 ```bash
 python botstrike.py --compare \
     --url-a https://datadome-site.com  --label-a "DataDome" \
     --url-b https://crowdsec-site.com  --label-b "CrowdSec" \
-    --mode full --confirm-authorized --yes \
+    --mode full --confirm-authorized \
     --operator "consultant@company.com"
 ```
 
-All flags (`--mode`, `--profile`, `--rps`, `--duration`, `--proxy`) apply equally to both targets.
+---
+
+## Distributed Mode — Run from Many VPS at Once
+
+> **What is this?** Instead of running BotStrike from your laptop (one IP), you run it from 3, 5, 10 VPS servers at the same time — each from a different IP, in a different country. This bypasses per-IP rate limits and generates realistic multi-source traffic. One command does everything.
 
 ---
 
-## Distributed Mode
+### Step 0 — Understand How It Works (Plain English)
 
-Distributed mode lets you run BotStrike across a fleet of Linux VPS nodes simultaneously with a single command. Every node executes the full pipeline independently from its own public IP address. This is the correct way to test bot protection against realistic multi-source traffic — bypassing per-IP rate limiting, generating geographically diverse requests, and producing a combined picture of how the target behaves under pressure from many sources at once.
-
-All orchestration happens over SSH. There is no agent to install on the VPS nodes, no daemon to run, no open ports to expose. BotStrike uploads itself, installs its own dependencies, runs, and downloads results — all automatically.
-
----
-
-### How Distributed Mode Works
+Here is exactly what happens when you run `--distributed`:
 
 ```
-Your local machine                       Remote VPS fleet
-──────────────────                       ──────────────────────────────────────
-botstrike.py --distributed
-    │
-    ├── Read nodes.yaml                  
-    ├── Launch one thread per node ──────┬─► node-sg-01 (Singapore)
-    │                                    ├─► node-fr-01 (Paris)      [parallel]
-    │                                    └─► node-us-01 (New York)   [parallel]
-    │
-    │   Per node (simultaneous):
-    │     1. SSH connect (key auth)
-    │     2. SFTP upload botstrike/ → ~/botstrike/
-    │     3. pip install -r requirements.txt
-    │     4. python3 botstrike.py --url <TARGET> --yes [flags...]
-    │     5. Stream stdout back in real-time → live dashboard
-    │     6. SFTP download JSON + HTML report
-    │     7. Parse key metrics (score, blocked%, requests)
-    │
-    ├── Live fleet table refreshes every 500ms (all nodes visible)
-    │
-    └── When all threads finish:
-          merge_results() → reports/distributed_<ts>/merged_report.json
-          Print fleet summary to terminal
+1. BotStrike reads your nodes.yaml file
+   (this is where you list your VPS servers — IP, username, SSH key)
+
+2. For each VPS, BotStrike:
+   a. Connects to it over SSH (using your key — no password)
+   b. Uploads itself (copies the BotStrike files to the VPS automatically)
+   c. Installs its dependencies (runs pip install on the VPS)
+   d. Runs the test (each VPS attacks the target from its own IP)
+   e. Downloads the results back to your machine
+
+3. All VPS servers run at the same time (parallel)
+
+4. BotStrike merges all results into one combined report
 ```
 
-**Why this matters for engagements:**
-
-A single-IP test is trivially blocked by rate limiting — the WAF blocks you, not the bot pattern. With 5 VPS nodes each sending 100 RPS from different IPs and countries, you have 500 combined RPS from 5 distinct sources. The WAF now needs to detect the *behavior pattern*, not just count requests per IP. That is where DataDome and CrowdSec are genuinely differentiated, and where the distributed results become meaningful evidence for your client.
+**You do NOT need to manually copy files to the VPS.**
+**You do NOT need to install anything on the VPS manually (except Python + pip).**
+**One command does everything.**
 
 ---
 
-### Prerequisites
+### Step 1 — Get Your VPS Servers
 
-**On your local machine:**
-- Python 3.9+ with BotStrike installed
-- `paramiko` Python library (`pip install paramiko`)
-- SSH private key with access to each VPS
+You need at least 1 Linux VPS. Any provider works: DigitalOcean, Vultr, Hetzner, Linode, OVH, etc.
 
-**On each VPS node:**
-- Debian / Ubuntu / Kali Linux (any modern version)
+Each VPS must have:
+- Debian, Ubuntu, or Kali Linux
 - Python 3.9 or newer
-- `pip3` / `python3-pip`
-- Outbound internet access to the target domain
-- SSH listening on the configured port, accessible from your local IP
+- `pip3` installed
+- SSH port open (usually port 22)
 
+If Python or pip is missing, run this on the VPS:
 ```bash
-# Minimum VPS setup (run on each node if needed)
 apt update && apt install -y python3 python3-pip
 ```
 
-No other software needs to be installed on the VPS nodes. BotStrike handles everything else automatically via `--setup-nodes`.
-
 ---
 
-### Step 1 — Generate a Dedicated SSH Key
+### Step 2 — Generate One SSH Key (on YOUR machine)
 
-Generate one key pair specifically for BotStrike. Do **not** reuse your personal SSH key — this keeps your fleet credentials isolated and easy to rotate.
+You need an SSH key so BotStrike can log into your VPS servers without a password.
+
+Run this **once on your local machine**:
 
 ```bash
 ssh-keygen -t ed25519 -C "botstrike-fleet" -f ~/.ssh/botstrike_key
 ```
 
 This creates two files:
-- `~/.ssh/botstrike_key` — your private key (stays on your machine, never shared)
-- `~/.ssh/botstrike_key.pub` — the public key (will be installed on each VPS)
+- `~/.ssh/botstrike_key` — your **private key** (stays on your machine, never shared)
+- `~/.ssh/botstrike_key.pub` — your **public key** (you put this on each VPS)
 
-Use `ed25519` for modern elliptic-curve security. If your VPS provider requires RSA:
-
-```bash
-ssh-keygen -t rsa -b 4096 -C "botstrike-fleet" -f ~/.ssh/botstrike_key
-```
+> **Same key for all VPS?** Yes. You generate one key pair. You install the public key on every VPS. Your private key stays on your machine and never moves.
 
 ---
 
-### Step 2 — Authorize the Key on Every VPS
+### Step 3 — Put the Public Key on Every VPS
 
-Push the public key to each VPS so BotStrike can connect without a password:
+Run this **for each VPS** (replace IP and user with your actual VPS details):
 
 ```bash
 ssh-copy-id -i ~/.ssh/botstrike_key.pub root@1.2.3.4
@@ -649,42 +421,42 @@ ssh-copy-id -i ~/.ssh/botstrike_key.pub ubuntu@5.6.7.8
 ssh-copy-id -i ~/.ssh/botstrike_key.pub kali@9.10.11.12
 ```
 
-Verify that key-only login works before proceeding:
+Then verify the connection works (no password should be asked):
 
 ```bash
 ssh -i ~/.ssh/botstrike_key root@1.2.3.4 "echo connected"
-# Output: connected
+# Should print: connected
 ```
 
-If you cannot use `ssh-copy-id` (e.g. VPS was provisioned with a password only), add the key manually:
-
+If `ssh-copy-id` is not available, do it manually on the VPS:
 ```bash
-# On the VPS, as root or the target user:
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
-echo "<paste contents of ~/.ssh/botstrike_key.pub here>" >> ~/.ssh/authorized_keys
+echo "PASTE YOUR PUBLIC KEY HERE" >> ~/.ssh/authorized_keys
 chmod 600 ~/.ssh/authorized_keys
 ```
+*(Your public key is the content of `~/.ssh/botstrike_key.pub` on your local machine)*
 
 ---
 
-### Step 3 — Create nodes.yaml
+### Step 4 — Create Your nodes.yaml File
 
-Copy the example file and fill in your VPS details:
+This file is where you tell BotStrike about your VPS servers.
 
+Copy the example file:
 ```bash
 cp nodes.yaml.example nodes.yaml
 ```
 
-Edit `nodes.yaml`:
+Open `nodes.yaml` and fill in your VPS details:
 
 ```yaml
 nodes:
 
-  - id: node-sg-01          # Label shown in reports and live dashboard
-    host: 1.2.3.4           # VPS public IP or hostname
-    user: root              # SSH user
-    key: ~/.ssh/botstrike_key  # Path to private key on YOUR machine
-    port: 22               # SSH port (optional — defaults to 22)
+  - id: node-sg-01               # A name for this server (you choose it, appears in reports)
+    host: 1.2.3.4                # The VPS IP address
+    user: root                   # The SSH username
+    key: ~/.ssh/botstrike_key    # Path to your private key (on YOUR machine)
+    port: 22                     # SSH port (default is 22, you can omit this line)
 
   - id: node-fr-01
     host: 5.6.7.8
@@ -697,381 +469,168 @@ nodes:
     key: ~/.ssh/botstrike_key
 ```
 
-**Field reference:**
+**Each entry is one VPS server. Add as many as you want.**
 
-| Field | Required | Description |
-|---|---|---|
-| `id` | yes | Friendly identifier. Appears in the live dashboard, per-node reports, and merged JSON. Use descriptive names like `sg-01`, `fr-vpn`, `us-east`. |
-| `host` | yes | VPS public IP address or fully qualified domain name. |
-| `user` | yes | SSH username. Must have Python 3.9+ and pip available. |
-| `key` | yes | Absolute or `~`-prefixed path to the **private** key file on your local machine. |
-| `port` | no | SSH port. Defaults to `22` if omitted. |
-
-`nodes.yaml` is permanently excluded from git via `.gitignore`. It will never be committed regardless of how many times you run `git add .`.
+> `nodes.yaml` is permanently excluded from git — it can never be accidentally committed, because it contains your server IPs.
 
 ---
 
-### Step 4 — Bootstrap the Fleet
+### Step 5 — Bootstrap the Fleet (First Time Only)
 
-Run the setup command once before your first engagement. This connects to every node in parallel, uploads BotStrike, installs all Python dependencies, and runs a smoke test:
+Run this once before your first distributed test. BotStrike will connect to every VPS, upload itself, and install its dependencies:
 
 ```bash
 python botstrike.py --setup-nodes
 ```
 
-You will see a live table showing each node's progress through the setup stages:
+You will see a live status table showing each VPS going through the stages:
 
 ```
-╭───────────────────────────────────────────────────────────────────────────╮
-│  BotStrike Distributed  ·  node setup  ·  3 nodes  ·  0 done  ·  12s    │
-├────────────────┬──────────────────┬──────────────┬─────────┬─────────────┤
-│ Node           │ Status           │ Phase        │ Elapsed │ Last        │
-├────────────────┼──────────────────┼──────────────┼─────────┼─────────────┤
-│ node-sg-01     │ ✓  DONE          │ —            │ 18s     │ Node ready  │
-│ node-fr-01     │ ⚙  INSTALLING    │ —            │ 12s     │ Running pip │
-│ node-us-east-01│ ↑  UPLOADING     │ —            │ 6s      │ Uploaded 14 │
-╰────────────────┴──────────────────┴──────────────┴─────────┴─────────────╯
-```
+╭────────────────────────────────────────────────────────────────╮
+│  BotStrike Distributed  ·  node setup  ·  3 nodes  ·  18s     │
+├─────────────────┬─────────────────┬──────────┬─────────────────┤
+│ Node            │ Status          │ Elapsed  │ Last            │
+├─────────────────┼─────────────────┼──────────┼─────────────────┤
+│ node-sg-01      │ ✓  DONE         │ 18s      │ Node ready      │
+│ node-fr-01      │ ⚙  INSTALLING   │ 12s      │ Running pip...  │
+│ node-us-east-01 │ ↑  UPLOADING    │ 6s       │ Uploaded 14...  │
+╰─────────────────┴─────────────────┴──────────┴─────────────────╯
 
-When complete:
-
-```
   Ready: 3/3   Failed: 0
 
   Nodes are ready. Run:
-    python botstrike.py --url <TARGET> --distributed --nodes nodes.yaml
+    python botstrike.py --url <TARGET> --distributed
 ```
 
-If a node fails, the error is shown inline. Common causes and fixes are in [Troubleshooting](#troubleshooting).
-
-**Using a custom nodes file:**
-
-```bash
-python botstrike.py --setup-nodes --nodes /path/to/my_nodes.yaml
-```
-
-**Re-running setup is safe.** Files are overwritten, pip skips already-installed packages, and the smoke test re-validates everything. Run it again any time you update BotStrike.
+**You only run `--setup-nodes` once.** After that, run it again only if you update BotStrike (it is safe to re-run at any time).
 
 ---
 
-### Step 5 — Run a Distributed Test
-
-#### Scraping only (no authorization required)
+### Step 6 — Run a Distributed Test
 
 ```bash
-python botstrike.py \
-    --url https://shop.example.com \
-    --mode scrape \
-    --distributed
-```
+# Scraping only (no authorization needed)
+python botstrike.py --url https://shop.example.com --mode scrape --distributed
 
-#### Full test including bot flood
+# Full test including bot flood (requires written authorization)
+python botstrike.py --url https://shop.example.com --mode full --confirm-authorized --distributed
 
-```bash
-python botstrike.py \
-    --url https://shop.example.com \
-    --mode full \
-    --confirm-authorized \
-    --distributed
-```
-
-#### Non-interactive (scripted / CI)
-
-```bash
-python botstrike.py \
-    --url https://shop.example.com \
-    --mode full \
-    --confirm-authorized \
-    --distributed \
-    --yes \
-    --operator "j.doe@company.com"
-```
-
-#### Heavy profile — maximum pressure from all nodes
-
-```bash
-python botstrike.py \
-    --url https://shop.example.com \
-    --mode full \
-    --confirm-authorized \
-    --distributed \
-    --profile heavy \
-    --rps 300 \
-    --duration 120
-```
-
-With 5 nodes at `--profile heavy`, you get 5 × 300 = **1,500 combined RPS** from 5 distinct IPs, each running for 120 seconds per vector.
-
-#### Custom nodes file
-
-```bash
-python botstrike.py \
-    --url https://shop.example.com \
-    --mode scrape \
-    --distributed \
-    --nodes /etc/botstrike/engagement_nodes.yaml
+# Heavy pressure from all nodes (5 nodes × 300 RPS = 1,500 combined RPS)
+python botstrike.py --url https://shop.example.com \
+    --mode full --confirm-authorized --distributed \
+    --profile heavy --rps 300 --duration 120
 ```
 
 ---
 
 ### Live Fleet Dashboard
 
-While a distributed run is in progress, BotStrike displays a live table that refreshes every 500ms. It shows all nodes simultaneously:
+While the test runs, you see all VPS servers in a live table:
 
 ```
-╭────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│  BotStrike Distributed  ·  https://shop.example.com  ·  3 nodes  ·  1 done  ·  0 failed  ·  142s  │
-├──────────────────┬─────────────────┬──────────────────┬──────────┬──────────┬────────┬────────┬────╮
-│ Node             │ Status          │ Phase            │ Requests │ Blocked% │ Score  │Elapsed │... │
-├──────────────────┼─────────────────┼──────────────────┼──────────┼──────────┼────────┼────────┤    │
-│ node-sg-01       │ ✓  DONE         │ Reporting        │ 1,842    │ 34.2%    │ C (67) │ 187s   │    │
-│ node-fr-01       │ ●  RUNNING      │ HTTP Flood       │ 18,431   │ 71.0%    │ —      │ 142s   │    │
-│ node-us-east-01  │ ●  RUNNING      │ Stealth Scrape   │ 203      │ 12.1%    │ —      │ 142s   │    │
-╰──────────────────┴─────────────────┴──────────────────┴──────────┴──────────┴────────┴────────┴────╯
+╭──────────────────────────────────────────────────────────────────────────────────╮
+│  BotStrike Distributed  ·  https://shop.example.com  ·  3 nodes  ·  142s        │
+├──────────────────┬──────────────────┬──────────────────┬──────────┬──────────────┤
+│ Node             │ Status           │ Phase            │ Requests │ Blocked%     │
+├──────────────────┼──────────────────┼──────────────────┼──────────┼──────────────┤
+│ node-sg-01       │ ✓  DONE          │ Reporting        │ 1,842    │ 34.2%        │
+│ node-fr-01       │ ●  RUNNING       │ HTTP Flood       │ 18,431   │ 71.0%        │
+│ node-us-east-01  │ ●  RUNNING       │ Stealth Scrape   │ 203      │ 12.1%        │
+╰──────────────────┴──────────────────┴──────────────────┴──────────┴──────────────╯
 ```
 
-**Column descriptions:**
-
-| Column | Description |
-|---|---|
-| Node | The `id` from `nodes.yaml` |
-| Status | `CONNECTING` → `UPLOADING` → `INSTALLING` → `RUNNING` → `DONE` / `FAILED` |
-| Phase | Current pipeline phase inferred from the node's stdout (`Pre-Flight`, `Recon`, `Stealth Scrape`, `Aggressive Scrape`, `HTTP Flood`, `Slowloris`, `POST Flood`, `Cache Buster`, `Reporting`) |
-| Requests | Total HTTP requests sent so far by this node |
-| Blocked% | Average of stealth blocked% and aggressive blocked% (populated after node finishes) |
-| Score | Protection grade and numeric score (populated after report is downloaded) |
-| Elapsed | Wall-clock seconds since this node's thread started |
-| Last Activity | Most recent stdout line from the remote run, or error message on failure |
+**Status stages:** `CONNECTING` → `UPLOADING` → `INSTALLING` → `RUNNING` → `DONE` / `FAILED`
 
 ---
 
-### Distributed Output Structure
+### Where Are the Results?
 
-All output is saved locally under `reports/distributed_<YYYYMMDD_HHMMSS>/`:
+All results are saved locally on your machine under `reports/distributed_<timestamp>/`:
 
 ```
 reports/
 └── distributed_20260506_143021/
-    ├── merged_report.json          ← Aggregated fleet results (main deliverable)
+    │
+    ├── merged_report.json        ← Combined results from ALL nodes (main report)
     │
     ├── node-sg-01/
-    │   ├── botstrike_<id>.json     ← Full individual report from this node
-    │   └── botstrike_<id>.html     ← Individual HTML dashboard from this node
+    │   ├── botstrike_abc.json    ← Full report from this specific node
+    │   └── botstrike_abc.html    ← HTML dashboard from this node (open in browser)
     │
     ├── node-fr-01/
-    │   ├── botstrike_<id>.json
-    │   └── botstrike_<id>.html
+    │   ├── botstrike_xyz.json
+    │   └── botstrike_xyz.html
     │
     └── node-us-east-01/
-        ├── botstrike_<id>.json
-        └── botstrike_<id>.html
+        ├── botstrike_def.json
+        └── botstrike_def.html
 ```
 
-- Individual JSON/HTML reports are full standard BotStrike reports, identical to what a single-node run would produce. They can be opened directly in a browser.
-- `merged_report.json` aggregates all nodes into one document (see below).
-- The `distributed_<ts>/` folder name is the engagement timestamp and is unique per run.
+**Open any `.html` file in your browser** to see the full visual dashboard for that node.
 
----
-
-### Merged Report Format
-
-`merged_report.json` has three top-level sections:
-
-```json
-{
-  "distributed": {
-    "node_count": 3,
-    "nodes_ok": 3,
-    "nodes_failed": 0,
-    "target": "https://shop.example.com",
-    "generated_at": "2026-05-06T14:52:11Z",
-    "tool_version": "1.0"
-  },
-
-  "aggregated": {
-    "total_requests_stealth": 4821,
-    "total_requests_aggressive": 9102,
-    "total_requests_all": 13923,
-    "items_extracted_total": 247,
-    "stealth_blocked_pct_avg": 28.4,
-    "aggressive_blocked_pct_avg": 61.7,
-    "ddos_vectors": {
-      "http_flood": {
-        "total_requests": 54300,
-        "rps_combined": 287.4,
-        "blocked_pct_avg": 71.2,
-        "latency_avg_ms": 143.8
-      },
-      "slowloris":    { ... },
-      "post_flood":   { ... },
-      "cache_buster": { ... }
-    },
-    "score": 68,
-    "grade": "C",
-    "recommendations": [ { "priority", "title", "detail" }, ... ]
-  },
-
-  "per_node": [
-    {
-      "node_id": "node-sg-01",
-      "host": "1.2.3.4",
-      "status": "DONE",
-      "score": 67,
-      "grade": "C",
-      "blocked_pct": 34.2,
-      "requests": 1842,
-      "html_report": "reports/distributed_.../node-sg-01/botstrike_abc123.html",
-      "json_report": "reports/distributed_.../node-sg-01/botstrike_abc123.json",
-      "log_tail": ["[SCRAPE:STEALTH] ...", "..."],
-      "data": { <full botstrike JSON for this node> }
-    },
-    { ... },
-    { ... }
-  ]
-}
-```
-
-**Aggregation logic:**
-
-| Metric | How it is combined |
-|---|---|
-| `total_requests_*` | Sum across all nodes |
-| `stealth_blocked_pct_avg` | Weighted average by request count per node |
-| `aggressive_blocked_pct_avg` | Weighted average by request count per node |
-| `ddos_vectors.total_requests` | Sum (nodes run the same vectors simultaneously) |
-| `ddos_vectors.rps_combined` | Sum of each node's avg RPS (real combined throughput) |
-| `ddos_vectors.blocked_pct_avg` | Average across nodes |
-| `score` | Average of all nodes' numeric scores |
-| `grade` | Derived from the averaged score |
-| `recommendations` | Union of all nodes' recommendations, deduplicated by title |
-
----
-
-### Distributed CLI Reference
-
-| Flag | Requires | Description |
-|---|---|---|
-| `--distributed` | `--url`, `nodes.yaml` present | Enable fleet mode. Uploads, runs, and collects from all nodes simultaneously. |
-| `--nodes FILE` | — | Override the default `nodes.yaml` path. Useful when managing multiple client engagement node files. |
-| `--setup-nodes` | `nodes.yaml` present | Bootstrap all nodes. No `--url` needed. Idempotent — safe to re-run. |
-
-All other flags pass through to each remote node unchanged:
-
-| Passed through | Not passed through |
-|---|---|
-| `--mode`, `--confirm-authorized`, `--yes` | `--distributed` (would cause infinite loop) |
-| `--profile`, `--rps`, `--duration`, `--connections` | `--proxy` (each node connects directly from its own IP — that is the point) |
-| `--operator` (suffixed with `@<node_id>`) | `--compare`, `--url-a`, `--url-b` |
-| `--config` | `--nodes`, `--setup-nodes` |
-
----
-
-### Security Model
-
-BotStrike's distributed mode is designed so that no sensitive data ever leaves your machine unintentionally, and no persistent footprint is left on the VPS nodes.
-
-**Authentication:**
-- SSH key-only authentication. Passwords are never used, stored, or prompted for.
-- The private key never leaves your local machine. Only the public key is installed on VPS nodes.
-- A dedicated key pair (`botstrike_key`) is recommended so it can be rotated independently of your personal keys.
-- BotStrike uses `paramiko` with `look_for_keys=False` and `allow_agent=False`, meaning it uses only the explicitly specified key file.
-
-**What is uploaded to each node:**
-- The BotStrike Python source code (no secrets, no reports, no config)
-- `nodes.yaml` is explicitly excluded from the SFTP upload — VPS IPs are never sent to other VPS nodes
-- Previously generated reports are excluded from the upload
-- `.git/` is excluded
-
-**What stays on the VPS after a run:**
-- `~/botstrike/` — the uploaded source code and generated reports
-- The reports in `~/botstrike/reports/` are downloaded to your local machine and can then be deleted remotely
-
-**`nodes.yaml` is gitignored.** The file containing your VPS IPs and key paths cannot be accidentally committed regardless of how you use git in this directory.
-
-**Host key verification:** BotStrike uses `AutoAddPolicy` (equivalent to `StrictHostKeyChecking=no`) for first-time connections. This is intentional for pentest tooling where nodes are provisioned fresh per engagement. If you require strict verification, you can modify `_connect()` in `modules/distributor.py` to use `RejectPolicy` and provide a known_hosts file.
+**`merged_report.json`** combines everything: total requests summed, blocked% averaged across all nodes, combined RPS, unified recommendations.
 
 ---
 
 ### Troubleshooting
 
-**Node shows `FAILED: SSH key not found: ~/.ssh/botstrike_key`**
-
-The key path in `nodes.yaml` does not resolve to an existing file on your local machine. Check the path:
-
+**"SSH key not found: ~/.ssh/botstrike_key"**
+The key file does not exist at that path on your machine.
 ```bash
 ls -la ~/.ssh/botstrike_key
+# If missing, go back to Step 2 and generate the key
 ```
-
-If it does not exist, run [Step 1](#step-1--generate-a-dedicated-ssh-key) again.
 
 ---
 
-**Node shows `FAILED: Auth failed — check SSH key`**
-
-The public key is not in the VPS's `authorized_keys` file. Run:
-
+**"Auth failed — check SSH key"**
+The public key is not installed on the VPS.
 ```bash
 ssh-copy-id -i ~/.ssh/botstrike_key.pub <user>@<host>
-# Then verify:
 ssh -i ~/.ssh/botstrike_key <user>@<host> "echo ok"
 ```
 
 ---
 
-**Node shows `FAILED: pip install failed`**
-
-Python or pip is missing on the VPS:
-
+**"pip install failed"**
+Python or pip is missing on the VPS.
 ```bash
-ssh -i ~/.ssh/botstrike_key <user>@<host> "python3 --version && pip3 --version"
+# Run on the VPS:
+apt update && apt install -y python3 python3-pip
+# Then re-run:
+python botstrike.py --setup-nodes
 ```
-
-Install if missing:
-
-```bash
-ssh -i ~/.ssh/botstrike_key root@<host> "apt update && apt install -y python3 python3-pip"
-```
-
-Then re-run `--setup-nodes`.
 
 ---
 
-**Node shows `FAILED: [Errno 111] Connection refused`**
-
-SSH is not running on the expected port, or a firewall is blocking it:
-
+**"Connection refused"**
+SSH is not running on that port, or the firewall is blocking it.
 ```bash
-# Test connectivity from your machine
-nc -zv <host> <port>
-# Check SSH on the VPS (if you have another way in)
-systemctl status ssh
+# Test from your machine:
+nc -zv <host> 22
+# Fix on the VPS:
+systemctl start ssh
 ufw allow 22
 ```
 
 ---
 
-**Node shows `DONE` but `merged_report.json` shows it with no data**
-
-The remote botstrike run exited before generating a report (e.g. target was unreachable from that node, or Python version was too old). Check the node's log:
-
+**Node says DONE but has no data in merged report**
+The test ran but exited before finishing (target unreachable from that node, or wrong Python version). Read the node's log:
 ```bash
-# The last 30 log lines are embedded in merged_report.json
 cat reports/distributed_*/merged_report.json | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 for n in d['per_node']:
-    print('\\n---', n['node_id'])
-    print('\\n'.join(n['log_tail']))
+    print('---', n['node_id'])
+    print('\n'.join(n['log_tail']))
 "
 ```
 
 ---
 
-**`paramiko` is not installed**
-
+**"paramiko is not installed"**
 ```bash
-pip install paramiko
-# or
 pip install -r requirements.txt
 ```
 
@@ -1079,23 +638,23 @@ pip install -r requirements.txt
 
 ## Proxy Support
 
-All modules (preflight, recon, scraping, bot flood) honor a single global proxy:
+Route all traffic through a proxy with `--proxy`:
 
 ```bash
 # HTTP proxy
 python botstrike.py --url https://shop.example.com --proxy http://proxyhost:8080
 
-# SOCKS5 / Tor
+# Tor (SOCKS5)
 python botstrike.py --url https://shop.example.com --proxy socks5://127.0.0.1:9050
 ```
 
-The proxy is set once at startup via `modules/utils.set_proxy()` and retrieved by every module via `get_proxy_dict()` which returns `{"http": url, "https": url}` for injection into `requests` and `requests.Session`.
+The proxy applies to every module: preflight, recon, scraping, and bot flood.
 
 ---
 
 ## Config File
 
-`config.yaml` provides defaults for all settings. CLI flags always override config file values.
+`config.yaml` sets the defaults for everything. CLI flags always override it.
 
 ```yaml
 scraping:
@@ -1111,7 +670,7 @@ scraping:
 ddos:
   rps: 100
   duration: 60
-  connections: 200        # slowloris concurrent connections
+  connections: 200
   ramp_up_seconds: 30
   pause_between_vectors: 10
 
@@ -1119,12 +678,10 @@ preflight:
   timeout: 10
 
 logging:
-  level: "INFO"           # DEBUG | INFO | WARNING
+  level: "INFO"    # DEBUG | INFO | WARNING
 ```
 
-Pass a custom config with `--config /path/to/my_config.yaml`.
-
-**Precedence:** CLI flags > config file > profile preset > built-in defaults.
+**Priority order:** CLI flags > config file > profile preset > built-in defaults.
 
 ---
 
@@ -1132,57 +689,50 @@ Pass a custom config with `--config /path/to/my_config.yaml`.
 
 ```
 botstrike/
-├── botstrike.py              Main entry point
-├── config.yaml               Default configuration
+├── botstrike.py              Main entry point — run this
+├── config.yaml               Default settings
 ├── requirements.txt          Python dependencies
+├── nodes.yaml.example        Template for your VPS fleet config
 ├── README.md
 ├── wordlists/
-│   └── useragents.txt        200+ browser User-Agent strings
+│   └── useragents.txt        200+ real browser User-Agent strings
 ├── modules/
-│   ├── __init__.py
-│   ├── utils.py              Console, logging, UA pool, stealth headers, proxy, response classifier
-│   ├── preflight.py          WAF/CDN fingerprinting + 8 probe requests
-│   ├── recon.py              robots.txt + sitemap.xml + homepage link extraction
-│   ├── scraper.py            Stealth + aggressive scraping, product extraction
-│   ├── ddos.py               4-vector bot flood, _Stats class, live dashboard
-│   └── reporter.py           Scoring, recommendations, JSON + HTML + comparison reports
-├── templates/
-│   ├── report.html.j2        Per-target HTML report (Jinja2)
-│   └── comparison.html.j2    Side-by-side comparison report (Jinja2)
-└── reports/                  Auto-created; contains all report output
-    └── <hostname>_<date>_<time>/
-        ├── botstrike_<sessionid>.json
-        ├── botstrike_<sessionid>.html
-        └── botstrike_<sessionid>.log
+│   ├── preflight.py          WAF/CDN detection + 8 attack probes
+│   ├── recon.py              robots.txt + sitemap + homepage crawler
+│   ├── scraper.py            Stealth + aggressive scraping
+│   ├── ddos.py               4-vector bot flood engine
+│   ├── reporter.py           Scoring, recommendations, JSON + HTML reports
+│   ├── distributor.py        SSH orchestration for distributed fleet mode
+│   └── utils.py              Shared helpers: UA pool, headers, proxy, logging
+└── templates/
+    ├── report.html.j2        HTML report template
+    └── comparison.html.j2    Side-by-side comparison template
 ```
 
 ---
 
 ## Dependencies
 
-| Package | Purpose |
+| Package | What it does |
 |---|---|
-| `requests` | All HTTP requests (preflight, recon, scraping, flood) |
-| `rich` | Terminal UI — colored output, live dashboards, progress bars, tables |
-| `beautifulsoup4` | HTML/XML parsing for recon and product extraction |
-| `lxml` | Fast HTML parser backend for BeautifulSoup |
-| `pyyaml` | YAML config file parsing |
-| `aiohttp` | Async HTTP (used in high-concurrency flood paths) |
-| `fake-useragent` | Fallback UA pool if `wordlists/useragents.txt` is absent |
-| `jinja2` | HTML report templating |
-| `urllib3` | Lower-level HTTP utilities |
-
-All dependencies are auto-installed at first run if missing.
+| `requests` | All HTTP requests |
+| `rich` | Terminal dashboards, tables, colored output |
+| `beautifulsoup4` | HTML/XML parsing |
+| `lxml` | Fast HTML parser |
+| `pyyaml` | Reads YAML config and nodes files |
+| `aiohttp` | Async HTTP for high-concurrency flood |
+| `fake-useragent` | Fallback UA pool |
+| `jinja2` | HTML report templates |
+| `urllib3` | HTTP utilities |
+| `paramiko` | SSH/SFTP for distributed mode |
 
 ---
 
 ## Legal Notice
 
-BotStrike is built for **authorized security testing only**.
+BotStrike is for **authorized security testing only**.
 
-- Use only against systems you **own** or have **explicit written authorization** to test.
-- The `--confirm-authorized` flag is a legally binding declaration of authorization.
-- Unauthorized use of this tool against third-party systems may violate computer crime laws in your jurisdiction (e.g. CFAA in the US, Computer Misuse Act in the UK, LCEN in France).
+- Only test systems you own or have **explicit written permission** to test.
+- The `--confirm-authorized` flag is a legally binding declaration of that authorization.
+- Unauthorized use may violate computer crime laws (CFAA in the US, Computer Misuse Act in the UK, etc.).
 - The authors accept no liability for unauthorized or illegal use.
-
-This tool is designed for professional engagements: security consultants comparing bot-protection vendors (DataDome, CrowdSec, Cloudflare, etc.) on behalf of clients who have commissioned the assessment.
