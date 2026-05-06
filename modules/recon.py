@@ -1,11 +1,14 @@
 import logging
+import threading
 from collections import defaultdict
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from .utils import console, log, now_utc, stealth_headers, get_proxy_dict
 
@@ -43,19 +46,59 @@ URL_CATEGORIES = {
     "static": [".css", ".js", ".png", ".jpg", ".svg", ".ico", ".woff"],
 }
 
-GUESS_PATHS = [
-    "/api/products",
-    "/api/catalog",
-    "/api/prices",
-    "/api/items",
-    "/api/v1/products",
-    "/api/v2/products",
-    "/search?q=*",
-    "/sitemap.xml",
-    "/robots.txt",
-    "/wp-json/wc/v3/products",
-    "/.well-known/security.txt",
-]
+_PATHS_FILE = Path(__file__).parent.parent / "wordlists" / "paths.txt"
+_PROBE_THREADS = 30
+_PROBE_TIMEOUT = 5
+# Any status code other than these is treated as "path exists"
+_DEAD_CODES = {404, 410}
+
+
+def _load_guess_paths() -> list[str]:
+    """Load path wordlist from file, stripping comments and blank lines."""
+    if not _PATHS_FILE.exists():
+        return []
+    paths = []
+    for line in _PATHS_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            paths.append(line)
+    return paths
+
+
+def _probe_paths(base_url: str, paths: list[str], timeout: int,
+                 logger: Optional[logging.Logger] = None) -> list[dict]:
+    """
+    Probe each path with a HEAD request in parallel.
+    Returns list of {url, status_code} for paths that responded (non-404).
+    """
+    parsed = urlparse(base_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    proxies = get_proxy_dict()
+    hdrs = {"User-Agent": stealth_headers().get("User-Agent", "Mozilla/5.0")}
+
+    results: list[dict] = []
+    lock = threading.Lock()
+    sem = threading.Semaphore(_PROBE_THREADS)
+
+    def probe(path: str) -> None:
+        url = base + path
+        with sem:
+            try:
+                r = requests.head(url, headers=hdrs, timeout=timeout,
+                                  proxies=proxies, allow_redirects=True, verify=False)
+                if r.status_code not in _DEAD_CODES:
+                    with lock:
+                        results.append({"url": url, "status_code": r.status_code})
+            except Exception:
+                pass
+
+    threads = [threading.Thread(target=probe, args=(p,), daemon=True) for p in paths]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    return results
 
 
 def _categorize(url: str) -> str:
@@ -163,6 +206,25 @@ def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = N
         log(f"  Homepage crawl error: {e}", "warning", logger)
 
     discovered.add(target_url)
+
+    # ── Guessed path probing ──────────────────────────────────────────────────
+    guess_paths = _load_guess_paths()
+    if guess_paths:
+        log(f"[RECON] Probing {len(guess_paths)} guessed paths ({_PROBE_THREADS} threads)...", "info", logger)
+        console.print(f"  [cyan]Probing {len(guess_paths)} common paths...[/cyan]", end="")
+        probed = _probe_paths(target_url, guess_paths, _PROBE_TIMEOUT, logger)
+        live_guessed = [r["url"] for r in probed]
+        discovered.update(live_guessed)
+        result["guessed_paths_probed"]    = len(guess_paths)
+        result["guessed_paths_live"]      = len(live_guessed)
+        result["guessed_paths_results"]   = probed
+        console.print(f" [bold green]{len(live_guessed)} live[/bold green] / {len(guess_paths)} probed")
+        log(f"  Guessed paths — {len(live_guessed)} live out of {len(guess_paths)}", "success", logger)
+    else:
+        result["guessed_paths_probed"]  = 0
+        result["guessed_paths_live"]    = 0
+        result["guessed_paths_results"] = []
+
     result["all_discovered_urls"] = list(discovered)
 
     categorized: dict[str, list] = defaultdict(list)
@@ -185,6 +247,10 @@ def _print_recon_summary(r: dict) -> None:
     table.add_row("robots.txt disallowed", str(len(r["disallowed_paths"])))
     table.add_row("sitemap.xml URLs", str(len(r["sitemap_urls"])))
     table.add_row("Homepage links", str(len(r["crawled_urls"])))
+    live = r.get("guessed_paths_live", 0)
+    total_guessed = r.get("guessed_paths_probed", 0)
+    if total_guessed:
+        table.add_row(f"Guessed paths (live/{total_guessed})", str(live))
     table.add_row("Total unique URLs", str(len(r["all_discovered_urls"])))
 
     cats = r.get("url_categories", {})
