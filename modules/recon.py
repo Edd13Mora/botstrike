@@ -360,10 +360,11 @@ def _install_katana(logger: Optional[logging.Logger] = None) -> bool:
     )
     log(f"  Katana not found — auto-install: distro={distro} arch={arch}", "info", logger)
 
-    # ── Method 1: apt (Kali only — katana is in the Kali repo) ───────────────
+    # ── Method 1a: apt after update (Kali — katana is in Kali repos) ─────────
     if distro == "kali" and shutil.which("apt"):
-        console.print("  [cyan]→[/cyan] Trying: sudo apt install -y katana")
+        console.print("  [cyan]→[/cyan] Trying: sudo apt update && sudo apt install -y katana")
         try:
+            subprocess.run(["sudo", "apt", "update", "-qq"], capture_output=True, timeout=60)
             proc = subprocess.run(
                 ["sudo", "apt", "install", "-y", "katana"],
                 capture_output=True, text=True, timeout=120,
@@ -375,6 +376,36 @@ def _install_katana(logger: Optional[logging.Logger] = None) -> bool:
             log(f"  apt failed (rc={proc.returncode}): {proc.stderr[:300]}", "warning", logger)
         except Exception as e:
             log(f"  apt install error: {e}", "warning", logger)
+
+    # ── Method 1b: ProjectDiscovery apt repo (Kali/Debian/Ubuntu) ────────────
+    if shutil.which("apt") and shutil.which("curl"):
+        console.print("  [cyan]→[/cyan] Trying: ProjectDiscovery apt repo")
+        try:
+            cmds = [
+                ["sudo", "apt", "install", "-y", "-q", "apt-transport-https", "gnupg"],
+                ["bash", "-c",
+                 "curl -fsSL https://apt.projectdiscovery.io/public.key "
+                 "| sudo gpg --dearmor -o /usr/share/keyrings/projectdiscovery.gpg"],
+                ["bash", "-c",
+                 "echo 'deb [signed-by=/usr/share/keyrings/projectdiscovery.gpg] "
+                 "https://apt.projectdiscovery.io stable main' "
+                 "| sudo tee /etc/apt/sources.list.d/projectdiscovery.list"],
+                ["sudo", "apt", "update", "-qq"],
+                ["sudo", "apt", "install", "-y", "katana"],
+            ]
+            ok = True
+            for cmd in cmds:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    ok = False
+                    log(f"  PD repo step failed: {' '.join(cmd)}: {r.stderr[:200]}", "warning", logger)
+                    break
+            if ok and shutil.which("katana"):
+                console.print("  [bold green]✓ Installed via ProjectDiscovery apt repo[/bold green]")
+                log("  Katana installed via ProjectDiscovery apt repo", "success", logger)
+                return True
+        except Exception as e:
+            log(f"  ProjectDiscovery repo install error: {e}", "warning", logger)
 
     # ── Method 2: go install (any distro with Go >= 1.21 on PATH) ────────────
     if shutil.which("go"):
