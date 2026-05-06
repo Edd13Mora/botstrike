@@ -427,21 +427,28 @@ def _install_katana(logger: Optional[logging.Logger] = None) -> bool:
         with urllib.request.urlopen(req, timeout=15) as resp:
             release = json.loads(resp.read())
 
-        # Prefer zip, fall back to tar.gz
+        # Asset names include the version: katana_1.1.0_linux_amd64.zip
+        # Match by substring so we don't need to know the version number.
+        # Prefer zip over tar.gz.
         asset_url  = None
         asset_name = None
-        for ext in ("zip", "tar.gz"):
-            candidate = f"katana_linux_{arch}.{ext}"
-            for asset in release.get("assets", []):
-                if asset["name"] == candidate:
+        all_assets = release.get("assets", [])
+        for ext in (".zip", ".tar.gz"):
+            for asset in all_assets:
+                name = asset["name"]
+                if f"linux_{arch}" in name and name.endswith(ext) and "checksums" not in name:
                     asset_url  = asset["browser_download_url"]
-                    asset_name = asset["name"]
+                    asset_name = name
                     break
             if asset_url:
                 break
 
         if not asset_url:
-            raise ValueError(f"No prebuilt binary for linux_{arch} in latest release")
+            available = [a["name"] for a in all_assets]
+            raise ValueError(
+                f"No prebuilt binary for linux_{arch} in latest release. "
+                f"Available: {available}"
+            )
 
         install_dir = Path(os.path.expanduser("~/.local/bin"))
         install_dir.mkdir(parents=True, exist_ok=True)
