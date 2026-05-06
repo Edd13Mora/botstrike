@@ -728,6 +728,7 @@ def main() -> None:
     # ── Basic auth setup ──
     if getattr(args, "basic_auth", None):
         from modules.utils import set_basic_auth
+        import requests as _requests
         raw = args.basic_auth
         if ":" not in raw:
             console.print("[red][!] --basic-auth must be in USER:PASS format[/red]")
@@ -735,6 +736,41 @@ def main() -> None:
         user, password = raw.split(":", 1)
         set_basic_auth(user, password)
         log(f"[AUTH] Basic auth set for user '{user}'", "info")
+
+        # Verify credentials immediately before running anything
+        target_for_check = args.url or getattr(args, "url_a", None)
+        if target_for_check:
+            console.print(f"  [cyan]Verifying Basic Auth credentials...[/cyan]", end=" ")
+            try:
+                r = _requests.get(
+                    target_for_check,
+                    auth=(user, password),
+                    timeout=10,
+                    verify=False,
+                    allow_redirects=True,
+                )
+                if r.status_code == 401:
+                    console.print("[bold red]FAILED[/bold red]")
+                    console.print(f"  [red]Server returned 401 — credentials rejected for '{user}'[/red]")
+                    if not args.yes:
+                        from rich.prompt import Confirm
+                        if not Confirm.ask("  Continue anyway?", default=False):
+                            console.print("[yellow]  Aborted.[/yellow]")
+                            sys.exit(1)
+                elif r.status_code in (403, 407):
+                    console.print("[bold red]FAILED[/bold red]")
+                    console.print(f"  [red]Server returned {r.status_code} — access denied[/red]")
+                    if not args.yes:
+                        from rich.prompt import Confirm
+                        if not Confirm.ask("  Continue anyway?", default=False):
+                            console.print("[yellow]  Aborted.[/yellow]")
+                            sys.exit(1)
+                else:
+                    console.print(f"[bold green]OK[/bold green] [dim](HTTP {r.status_code})[/dim]")
+                    log(f"[AUTH] Credentials verified — HTTP {r.status_code}", "success")
+            except Exception as e:
+                console.print(f"[yellow]Could not verify (network error: {e})[/yellow]")
+                log(f"[AUTH] Could not verify credentials: {e}", "warning")
 
     # ── Profile info ──
     profile = getattr(args, "profile", "medium") or "medium"
