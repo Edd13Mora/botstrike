@@ -1,4 +1,5 @@
 import logging
+import re
 import threading
 from collections import defaultdict
 from pathlib import Path
@@ -8,9 +9,10 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from .utils import console, log, now_utc, stealth_headers, get_proxy_dict
+
+# ── Flow classification ───────────────────────────────────────────────────────
 
 FLOW_PATTERNS: dict[str, list[str]] = {
     "login":          ["/login", "/signin", "/sign-in", "/auth/login", "/account/login", "/user/login", "/session/new"],
@@ -23,10 +25,6 @@ FLOW_PATTERNS: dict[str, list[str]] = {
 
 
 def classify_flows(urls: list[str]) -> dict[str, list[str]]:
-    """
-    Classify discovered URLs into named attack-flow categories.
-    Returns only categories with at least one matching URL.
-    """
     flows: dict[str, list[str]] = {k: [] for k in FLOW_PATTERNS}
     for url in urls:
         path = url.lower()
@@ -37,24 +35,220 @@ def classify_flows(urls: list[str]) -> dict[str, list[str]]:
     return {k: v for k, v in flows.items() if v}
 
 
+# ── URL categorisation (for reporting) ───────────────────────────────────────
+
 URL_CATEGORIES = {
-    "product": ["/product", "/item", "/p/", "/detail", "/produit", "/artikel"],
+    "product":  ["/product", "/item", "/p/", "/detail", "/produit", "/artikel"],
     "category": ["/category", "/cat/", "/c/", "/collection", "/catalog", "/categorie"],
-    "search": ["/search", "/recherche", "/suche", "/buscar", "?q=", "?search=", "?s="],
-    "cart": ["/cart", "/basket", "/panier", "/warenkorb", "/checkout"],
-    "api": ["/api/", "/graphql", "/v1/", "/v2/", "/rest/"],
-    "static": [".css", ".js", ".png", ".jpg", ".svg", ".ico", ".woff"],
+    "search":   ["/search", "/recherche", "/suche", "/buscar", "?q=", "?search=", "?s="],
+    "cart":     ["/cart", "/basket", "/panier", "/warenkorb", "/checkout"],
+    "api":      ["/api/", "/graphql", "/v1/", "/v2/", "/rest/"],
+    "static":   [".css", ".js", ".png", ".jpg", ".svg", ".ico", ".woff"],
 }
 
-_PATHS_FILE = Path(__file__).parent.parent / "wordlists" / "paths.txt"
-_PROBE_THREADS = 30
+
+def _categorize(url: str) -> str:
+    lower = url.lower()
+    for cat, patterns in URL_CATEGORIES.items():
+        for p in patterns:
+            if p in lower:
+                return cat
+    return "other"
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _is_internal(url: str, base_host: str) -> bool:
+    try:
+        return urlparse(url).hostname == base_host
+    except Exception:
+        return False
+
+
+_STATIC_EXTS = frozenset({
+    ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".webp", ".pdf",
+    ".zip", ".tar", ".gz", ".map",
+})
+
+
+def _is_static(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return any(path.endswith(ext) for ext in _STATIC_EXTS)
+
+
+# ── Deep HTML extraction ──────────────────────────────────────────────────────
+
+def _extract_from_html(html: str, base_url: str, base_host: str) -> tuple[list[str], list[str]]:
+    """
+    Extract URLs from HTML more deeply than just <a href>.
+    Returns (page_urls, js_file_urls).
+
+    Sources:
+      - <a href>
+      - <form action>  (POST endpoints)
+      - data-href, data-url, data-action, data-src, data-endpoint
+      - <script src>   (collected for JS parsing)
+      - <link href>    (non-static)
+    """
+    soup = BeautifulSoup(html, "lxml")
+    page_urls: set[str] = set()
+    js_urls:   set[str] = set()
+
+    def _add(raw: str, source_url: str = base_url) -> None:
+        raw = raw.strip()
+        if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+            return
+        full = urljoin(source_url, raw)
+        p = urlparse(full)
+        if p.scheme not in ("http", "https"):
+            return
+        if _is_internal(full, base_host) and not _is_static(full):
+            page_urls.add(full)
+
+    # <a href>
+    for tag in soup.find_all("a", href=True):
+        _add(tag["href"])
+
+    # <form action> — these are POST endpoints, valuable for flood targeting
+    for tag in soup.find_all("form"):
+        action = tag.get("action", "")
+        if action:
+            _add(action)
+
+    # data-* attributes
+    data_attrs = ("data-href", "data-url", "data-action", "data-src",
+                  "data-endpoint", "data-target", "data-link", "data-path")
+    for tag in soup.find_all(True):
+        for attr in data_attrs:
+            val = tag.get(attr, "")
+            if val:
+                _add(val)
+
+    # <script src> — JS files to parse for hidden API paths
+    for tag in soup.find_all("script", src=True):
+        src = tag["src"].strip()
+        if src:
+            full = urljoin(base_url, src)
+            p = urlparse(full)
+            if p.scheme in ("http", "https") and full.split("?")[0].endswith(".js"):
+                js_urls.add(full)
+
+    return list(page_urls), list(js_urls)
+
+
+# ── JavaScript parsing ────────────────────────────────────────────────────────
+
+# Patterns that find URL paths inside JavaScript source code
+_JS_PATTERNS: list[re.Pattern] = [
+    # fetch('/api/...') and fetch(`/api/${v}/...`)
+    re.compile(r'''fetch\s*\(\s*['"`]([/][^'"`\s\)]{2,100})'''),
+    # axios.get/post/put/patch/delete('/path')
+    re.compile(r'''axios\s*\.\s*(?:get|post|put|patch|delete|head|request)\s*\(\s*['"`]([/][^'"`\s\)]{2,100})'''),
+    # $.get/post/ajax(url)
+    re.compile(r'''\$\s*\.\s*(?:get|post|ajax|put|delete)\s*\(\s*['"`]([/][^'"`\s\)]{2,100})'''),
+    # {url: '/path'}  — used in $.ajax, axios config, etc.
+    re.compile(r'''['"]url['"]\s*:\s*['"`]([/][^'"`\s,\)]{2,100})'''),
+    # XMLHttpRequest .open('METHOD', '/path')
+    re.compile(r'''\.open\s*\(\s*['"`]\w+['"`]\s*,\s*['"`]([/][^'"`\s\)]{2,100})'''),
+    # this.$http.get/post  (Vue)
+    re.compile(r'''\.\$http\s*\.\s*(?:get|post|put|delete|patch)\s*\(\s*['"`]([/][^'"`\s\)]{2,100})'''),
+    # API string literals — paths starting with /api, /v1, /v2, /rest, /graphql
+    re.compile(r'''['"`]([/](?:api|v\d+|rest|graphql|rpc|auth|account|user|product|order|cart|checkout|search|admin|catalog)[^'"`\s]{0,80})['"`]'''),
+    # Vue/React/Angular route path: '/checkout'
+    re.compile(r'''path\s*:\s*['"`]([/][^'"`\s]{1,80})['"`]'''),
+    # next.js / react-router <Route path="/...">
+    re.compile(r'''<Route[^>]+path\s*=\s*['"`]([/][^'"`\s]{1,80})['"`]'''),
+]
+
+_JS_STATIC = frozenset({".png", ".jpg", ".svg", ".css", ".woff", ".woff2", ".ico", ".gif"})
+
+
+def _extract_from_js(js_content: str, base_url: str) -> list[str]:
+    """Extract API paths and route definitions from JavaScript source."""
+    found: set[str] = set()
+    for pattern in _JS_PATTERNS:
+        for m in pattern.finditer(js_content):
+            path = m.group(1)
+            # Strip template literal variables like ${version}
+            path = re.sub(r'\$\{[^}]+\}', '', path).rstrip("/")
+            if not path or not path.startswith("/"):
+                continue
+            if any(path.lower().endswith(ext) for ext in _JS_STATIC):
+                continue
+            if len(path) > 120:
+                continue
+            found.add(path)
+    return list(found)
+
+
+def _fetch_js_files(js_urls: list[str], session: requests.Session,
+                    timeout: int, base_url: str,
+                    logger: Optional[logging.Logger] = None) -> list[str]:
+    """Fetch each JS file and extract API paths from it. Returns raw paths (not full URLs)."""
+    all_paths: set[str] = set()
+    lock = threading.Lock()
+
+    def fetch_one(url: str) -> None:
+        try:
+            r = session.get(url, timeout=timeout, verify=False)
+            if r.status_code == 200 and len(r.text) < 5_000_000:  # skip huge bundles >5MB
+                paths = _extract_from_js(r.text, base_url)
+                with lock:
+                    all_paths.update(paths)
+        except Exception:
+            pass
+
+    threads = [threading.Thread(target=fetch_one, args=(u,), daemon=True) for u in js_urls[:30]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    log(f"  JS parsing → {len(all_paths)} paths extracted from {len(js_urls)} files", "success", logger)
+    return list(all_paths)
+
+
+# ── Path fuzzing ──────────────────────────────────────────────────────────────
+
+def _fuzz_paths(discovered_paths: list[str]) -> list[str]:
+    """
+    Generate path variations from already-discovered API paths.
+    Only fuzzes paths that look like API endpoints.
+    """
+    api_paths = [p for p in discovered_paths if re.search(r'/(?:api|v\d+|graphql|rest)', p.lower())]
+    fuzzed: set[str] = set()
+
+    for path in api_paths:
+        # Version bumping: /v1/ → /v2/, /v3/
+        for v in ("v1", "v2", "v3", "v4"):
+            fuzzed.add(re.sub(r'/v\d+/', f'/{v}/', path))
+
+        # JSON format hints
+        if not re.search(r'\.(json|xml|html|csv)$', path):
+            fuzzed.add(path + ".json")
+            fuzzed.add(path + "?format=json")
+            fuzzed.add(path + "?_format=json")
+
+        # Common collection sub-resources
+        base = path.rstrip("/")
+        for suffix in ("/list", "/all", "/search", "/count", "/export",
+                       "/1", "/me", "/status", "/schema"):
+            fuzzed.add(base + suffix)
+
+    # Remove paths already in the discovered set
+    return list(fuzzed - set(discovered_paths))
+
+
+# ── Parallel path prober ──────────────────────────────────────────────────────
+
+_PATHS_FILE    = Path(__file__).parent.parent / "wordlists" / "paths.txt"
+_PROBE_THREADS = 40
 _PROBE_TIMEOUT = 5
-# Any status code other than these is treated as "path exists"
-_DEAD_CODES = {404, 410}
+_DEAD_CODES    = {404, 410}
 
 
 def _load_guess_paths() -> list[str]:
-    """Load path wordlist from file, stripping comments and blank lines."""
     if not _PATHS_FILE.exists():
         return []
     paths = []
@@ -66,19 +260,20 @@ def _load_guess_paths() -> list[str]:
 
 
 def _probe_paths(base_url: str, paths: list[str], timeout: int,
+                 label: str = "paths",
                  logger: Optional[logging.Logger] = None) -> list[dict]:
     """
-    Probe each path with a HEAD request in parallel.
-    Returns list of {url, status_code} for paths that responded (non-404).
+    HEAD-probe a list of paths in parallel.
+    Returns list of {url, status_code} for every path that responded (non-404/410).
     """
-    parsed = urlparse(base_url)
-    base = f"{parsed.scheme}://{parsed.netloc}"
+    parsed  = urlparse(base_url)
+    base    = f"{parsed.scheme}://{parsed.netloc}"
     proxies = get_proxy_dict()
-    hdrs = {"User-Agent": stealth_headers().get("User-Agent", "Mozilla/5.0")}
+    hdrs    = {"User-Agent": stealth_headers().get("User-Agent", "Mozilla/5.0")}
 
     results: list[dict] = []
     lock = threading.Lock()
-    sem = threading.Semaphore(_PROBE_THREADS)
+    sem  = threading.Semaphore(_PROBE_THREADS)
 
     def probe(path: str) -> None:
         url = base + path
@@ -101,130 +296,137 @@ def _probe_paths(base_url: str, paths: list[str], timeout: int,
     return results
 
 
-def _categorize(url: str) -> str:
-    lower = url.lower()
-    for cat, patterns in URL_CATEGORIES.items():
-        for p in patterns:
-            if p in lower:
-                return cat
-    return "other"
-
-
-def _is_internal(url: str, base_host: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        return parsed.hostname == base_host or parsed.hostname is None
-    except Exception:
-        return False
-
-
-def _extract_links(html: str, base_url: str, base_host: str) -> list[str]:
-    soup = BeautifulSoup(html, "lxml")
-    links = []
-    for tag in soup.find_all("a", href=True):
-        href = tag["href"].strip()
-        if not href or href.startswith("#") or href.startswith("mailto:") or href.startswith("tel:"):
-            continue
-        full = urljoin(base_url, href)
-        parsed = urlparse(full)
-        if parsed.scheme not in ("http", "https"):
-            continue
-        if _is_internal(full, base_host):
-            links.append(full)
-    return list(set(links))
-
+# ── Main recon runner ─────────────────────────────────────────────────────────
 
 def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = None) -> dict:
     result: dict = {
-        "robots_txt_content": "",
-        "disallowed_paths": [],
-        "allowed_paths": [],
-        "sitemap_urls": [],
-        "crawled_urls": [],
-        "url_categories": defaultdict(list),
-        "all_discovered_urls": [],
+        "robots_txt_content":    "",
+        "disallowed_paths":      [],
+        "allowed_paths":         [],
+        "sitemap_urls":          [],
+        "crawled_urls":          [],
+        "js_paths_extracted":    0,
+        "guessed_paths_probed":  0,
+        "guessed_paths_live":    0,
+        "fuzzed_paths_probed":   0,
+        "fuzzed_paths_live":     0,
+        "url_categories":        {},
+        "all_discovered_urls":   [],
+        "classified_flows":      {},
     }
 
     parsed_base = urlparse(target_url)
-    base_host = parsed_base.hostname or ""
-    proxies = get_proxy_dict()
-    session = requests.Session()
+    base_host   = parsed_base.hostname or ""
+    proxies     = get_proxy_dict()
+    session     = requests.Session()
     session.headers.update(stealth_headers())
     if proxies:
         session.proxies.update(proxies)
 
+    discovered: set[str] = set()
+    all_js_urls: set[str] = set()
+
+    # ── 1. robots.txt ─────────────────────────────────────────────────────────
     log("[RECON] Fetching robots.txt...", "info", logger)
-    robots_url = target_url.rstrip("/") + "/robots.txt"
     try:
-        r = session.get(robots_url, timeout=timeout)
+        r = session.get(target_url.rstrip("/") + "/robots.txt", timeout=timeout)
         if r.status_code == 200:
             result["robots_txt_content"] = r.text
             for line in r.text.splitlines():
                 line = line.strip()
                 if line.lower().startswith("disallow:"):
-                    path = line[9:].strip()
-                    if path:
-                        result["disallowed_paths"].append(path)
+                    p = line[9:].strip()
+                    if p:
+                        result["disallowed_paths"].append(p)
                 elif line.lower().startswith("allow:"):
-                    path = line[6:].strip()
-                    if path:
-                        result["allowed_paths"].append(path)
+                    p = line[6:].strip()
+                    if p:
+                        result["allowed_paths"].append(p)
             log(f"  robots.txt → {len(result['disallowed_paths'])} disallowed, "
-                f"{len(result['allowed_paths'])} allowed paths", "success", logger)
+                f"{len(result['allowed_paths'])} allowed", "success", logger)
         else:
             log(f"  robots.txt → HTTP {r.status_code}", "warning", logger)
     except Exception as e:
         log(f"  robots.txt error: {e}", "warning", logger)
 
+    # ── 2. sitemap.xml ────────────────────────────────────────────────────────
     log("[RECON] Fetching sitemap.xml...", "info", logger)
-    sitemap_url = target_url.rstrip("/") + "/sitemap.xml"
     try:
-        r = session.get(sitemap_url, timeout=timeout)
+        r = session.get(target_url.rstrip("/") + "/sitemap.xml", timeout=timeout)
         if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "lxml-xml") if "xml" in r.headers.get("Content-Type", "") \
-                else BeautifulSoup(r.text, "lxml")
-            locs = soup.find_all("loc")
-            result["sitemap_urls"] = [loc.text.strip() for loc in locs]
-            log(f"  sitemap.xml → {len(result['sitemap_urls'])} URLs extracted", "success", logger)
+            ct = r.headers.get("Content-Type", "")
+            soup = BeautifulSoup(r.text, "lxml-xml" if "xml" in ct else "lxml")
+            locs = [loc.text.strip() for loc in soup.find_all("loc")]
+            result["sitemap_urls"] = locs
+            discovered.update(locs)
+            log(f"  sitemap.xml → {len(locs)} URLs", "success", logger)
         else:
             log(f"  sitemap.xml → HTTP {r.status_code}", "warning", logger)
     except Exception as e:
         log(f"  sitemap.xml error: {e}", "warning", logger)
 
-    log("[RECON] Crawling homepage for internal links...", "info", logger)
-    discovered: set[str] = set()
-    discovered.update(result["sitemap_urls"])
-
+    # ── 3. Deep HTML extraction (homepage) ────────────────────────────────────
+    log("[RECON] Crawling homepage (deep HTML extraction)...", "info", logger)
     try:
         r = session.get(target_url, timeout=timeout)
         if r.status_code == 200:
-            home_links = _extract_links(r.text, target_url, base_host)
-            result["crawled_urls"] = home_links
-            discovered.update(home_links)
-            log(f"  Homepage crawl → {len(home_links)} links found", "success", logger)
+            page_urls, js_urls = _extract_from_html(r.text, target_url, base_host)
+            result["crawled_urls"] = page_urls
+            discovered.update(page_urls)
+            all_js_urls.update(js_urls)
+            log(f"  Homepage → {len(page_urls)} URLs, {len(js_urls)} JS files", "success", logger)
     except Exception as e:
         log(f"  Homepage crawl error: {e}", "warning", logger)
 
     discovered.add(target_url)
 
-    # ── Guessed path probing ──────────────────────────────────────────────────
+    # ── 4. JavaScript parsing ─────────────────────────────────────────────────
+    if all_js_urls:
+        log(f"[RECON] Parsing {len(all_js_urls)} JS files for hidden endpoints...", "info", logger)
+        console.print(f"  [cyan]Parsing {len(all_js_urls)} JS files...[/cyan]", end="")
+        raw_js_paths = _fetch_js_files(list(all_js_urls), session, timeout, target_url, logger)
+        result["js_paths_extracted"] = len(raw_js_paths)
+
+        # Probe JS-extracted paths to check which actually exist
+        if raw_js_paths:
+            js_probed = _probe_paths(target_url, raw_js_paths, _PROBE_TIMEOUT, "JS paths", logger)
+            js_live = [e["url"] for e in js_probed]
+            discovered.update(js_live)
+            console.print(f" [bold green]{len(js_live)} live[/bold green] / {len(raw_js_paths)} extracted")
+            log(f"  JS paths — {len(js_live)} live from {len(raw_js_paths)} extracted", "success", logger)
+        else:
+            console.print(" [dim]none found[/dim]")
+    else:
+        log("[RECON] No JS files found to parse.", "info", logger)
+
+    # ── 5. Wordlist path probing ───────────────────────────────────────────────
     guess_paths = _load_guess_paths()
     if guess_paths:
-        log(f"[RECON] Probing {len(guess_paths)} guessed paths ({_PROBE_THREADS} threads)...", "info", logger)
-        console.print(f"  [cyan]Probing {len(guess_paths)} common paths...[/cyan]", end="")
-        probed = _probe_paths(target_url, guess_paths, _PROBE_TIMEOUT, logger)
-        live_guessed = [r["url"] for r in probed]
+        log(f"[RECON] Probing {len(guess_paths)} wordlist paths ({_PROBE_THREADS} threads)...", "info", logger)
+        console.print(f"  [cyan]Probing {len(guess_paths)} wordlist paths...[/cyan]", end="")
+        probed = _probe_paths(target_url, guess_paths, _PROBE_TIMEOUT, "wordlist", logger)
+        live_guessed = [e["url"] for e in probed]
         discovered.update(live_guessed)
-        result["guessed_paths_probed"]    = len(guess_paths)
-        result["guessed_paths_live"]      = len(live_guessed)
-        result["guessed_paths_results"]   = probed
+        result["guessed_paths_probed"] = len(guess_paths)
+        result["guessed_paths_live"]   = len(live_guessed)
         console.print(f" [bold green]{len(live_guessed)} live[/bold green] / {len(guess_paths)} probed")
-        log(f"  Guessed paths — {len(live_guessed)} live out of {len(guess_paths)}", "success", logger)
-    else:
-        result["guessed_paths_probed"]  = 0
-        result["guessed_paths_live"]    = 0
-        result["guessed_paths_results"] = []
+        log(f"  Wordlist — {len(live_guessed)} live / {len(guess_paths)} probed", "success", logger)
 
+    # ── 6. Fuzzing discovered API paths ───────────────────────────────────────
+    all_paths_so_far = [urlparse(u).path for u in discovered]
+    fuzz_candidates  = _fuzz_paths(all_paths_so_far)
+    if fuzz_candidates:
+        log(f"[RECON] Fuzzing {len(fuzz_candidates)} path variations...", "info", logger)
+        console.print(f"  [cyan]Fuzzing {len(fuzz_candidates)} path variations...[/cyan]", end="")
+        fuzz_probed = _probe_paths(target_url, fuzz_candidates, _PROBE_TIMEOUT, "fuzz", logger)
+        fuzz_live   = [e["url"] for e in fuzz_probed]
+        discovered.update(fuzz_live)
+        result["fuzzed_paths_probed"] = len(fuzz_candidates)
+        result["fuzzed_paths_live"]   = len(fuzz_live)
+        console.print(f" [bold green]{len(fuzz_live)} live[/bold green] / {len(fuzz_candidates)} fuzzed")
+        log(f"  Fuzzing — {len(fuzz_live)} live / {len(fuzz_candidates)} tried", "success", logger)
+
+    # ── 7. Finalise ───────────────────────────────────────────────────────────
     result["all_discovered_urls"] = list(discovered)
 
     categorized: dict[str, list] = defaultdict(list)
@@ -232,35 +434,46 @@ def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = N
         cat = _categorize(url)
         categorized[cat].append(url)
     result["url_categories"] = dict(categorized)
-
     result["classified_flows"] = classify_flows(result["all_discovered_urls"])
 
     _print_recon_summary(result)
     return result
 
 
-def _print_recon_summary(r: dict) -> None:
-    table = Table(title="Passive Recon Summary", show_header=True, header_style="bold cyan")
-    table.add_column("Source", style="bold white", width=20)
-    table.add_column("Count", justify="right")
+# ── Summary table ─────────────────────────────────────────────────────────────
 
-    table.add_row("robots.txt disallowed", str(len(r["disallowed_paths"])))
-    table.add_row("sitemap.xml URLs", str(len(r["sitemap_urls"])))
-    table.add_row("Homepage links", str(len(r["crawled_urls"])))
-    live = r.get("guessed_paths_live", 0)
-    total_guessed = r.get("guessed_paths_probed", 0)
-    if total_guessed:
-        table.add_row(f"Guessed paths (live/{total_guessed})", str(live))
-    table.add_row("Total unique URLs", str(len(r["all_discovered_urls"])))
+def _print_recon_summary(r: dict) -> None:
+    table = Table(title="Recon Summary", show_header=True, header_style="bold cyan")
+    table.add_column("Source",  style="bold white", width=32)
+    table.add_column("Count",   justify="right")
+
+    table.add_row("robots.txt disallowed",    str(len(r["disallowed_paths"])))
+    table.add_row("sitemap.xml URLs",         str(len(r["sitemap_urls"])))
+    table.add_row("Homepage links (deep HTML)", str(len(r["crawled_urls"])))
+    table.add_row("JS files → live endpoints", str(r.get("js_paths_extracted", 0)))
+
+    live_g = r.get("guessed_paths_live", 0)
+    tot_g  = r.get("guessed_paths_probed", 0)
+    if tot_g:
+        table.add_row(f"Wordlist paths (live/{tot_g})", str(live_g))
+
+    live_f = r.get("fuzzed_paths_live", 0)
+    tot_f  = r.get("fuzzed_paths_probed", 0)
+    if tot_f:
+        table.add_row(f"Fuzzed paths (live/{tot_f})", str(live_f))
+
+    table.add_row("[bold]Total unique URLs[/bold]", f"[bold]{len(r['all_discovered_urls'])}[/bold]")
 
     cats = r.get("url_categories", {})
-    for cat, urls in cats.items():
-        table.add_row(f"  → {cat}", str(len(urls)))
+    if cats:
+        table.add_row("", "")
+        for cat, urls in cats.items():
+            table.add_row(f"  → {cat}", str(len(urls)))
 
     flows = r.get("classified_flows", {})
     if flows:
         table.add_row("", "")
-        table.add_row("[bold cyan]Attack Flows Found[/bold cyan]", "")
+        table.add_row("[bold cyan]Attack Flows Identified[/bold cyan]", "")
         for flow, urls in flows.items():
             table.add_row(f"  ★ {flow}", str(len(urls)))
 
