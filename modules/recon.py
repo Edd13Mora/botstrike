@@ -469,7 +469,7 @@ def _install_katana(logger: Optional[logging.Logger] = None) -> bool:
         install_dir = Path(os.path.expanduser("~/.local/bin"))
         install_dir.mkdir(parents=True, exist_ok=True)
 
-        console.print(f"  [cyan]  Downloading {asset_name}...[/cyan]", end="", flush=True)
+        console.print(f"  [cyan]  Downloading {asset_name}...[/cyan]", end="")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir) / asset_name
             urllib.request.urlretrieve(asset_url, str(tmp_path))
@@ -532,7 +532,7 @@ def _run_katana(target_url: str, base_host: str,
             return []
 
     log("[RECON] Katana — running headless JS crawl + passive sources...", "info", logger)
-    console.print("  [bold cyan][katana][/bold cyan] Crawling (JS + passive)...", end="", flush=True)
+    console.print("  [bold cyan][katana][/bold cyan] Crawling (JS + passive)...", end="")
 
     try:
         proc = subprocess.run(
