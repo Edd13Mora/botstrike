@@ -13,7 +13,8 @@ BLOCK_CODES = {403, 406, 429, 503}
 
 # ─── Protection Score ─────────────────────────────────────────────────────────
 
-def calculate_protection_score(preflight: dict, scraping: dict, ddos: dict) -> dict:
+def calculate_protection_score(preflight: dict, scraping: dict, ddos: dict,
+                               goodbot_data: Optional[dict] = None) -> dict:
     """
     Score the target's bot protection from 0-100 and convert to an A-F grade.
     Each finding deducts points; higher score = better protection.
@@ -86,6 +87,17 @@ def calculate_protection_score(preflight: dict, scraping: dict, ddos: dict) -> d
         score -= 5
         findings.append({"sev": "LOW", "msg": "HSTS header missing"})
 
+    # ── Good bot over-blocking ──
+    if goodbot_data:
+        over = goodbot_data.get("over_blocked_count", 0)
+        blocked = goodbot_data.get("blocked_bots", [])
+        if over > 0:
+            score -= 15
+            findings.append({"sev": "HIGH",
+                             "msg": f"WAF is blocking {over} legitimate crawler(s): {', '.join(blocked)}"})
+        else:
+            findings.append({"sev": "PASS", "msg": "All legitimate crawlers (Googlebot, Meta, etc.) are allowed"})
+
     score = max(0, score)
     if score >= 90:   grade = "A"
     elif score >= 80: grade = "B"
@@ -99,7 +111,8 @@ def calculate_protection_score(preflight: dict, scraping: dict, ddos: dict) -> d
 # ─── Recommendations ──────────────────────────────────────────────────────────
 
 def generate_recommendations(preflight: dict, scraping: dict, ddos: dict,
-                              score_data: dict) -> list[dict]:
+                              score_data: dict,
+                              goodbot_data: Optional[dict] = None) -> list[dict]:
     """
     Generate prioritised, actionable recommendations based on test findings.
     Tailored to DataDome and CrowdSec deployment context.
@@ -210,6 +223,23 @@ def generate_recommendations(preflight: dict, scraping: dict, ddos: dict,
             ),
         })
 
+    # ── Good bot over-blocking ──
+    if goodbot_data and goodbot_data.get("over_blocked_count", 0) > 0:
+        blocked = goodbot_data.get("blocked_bots", [])
+        recs.append({
+            "priority": "HIGH",
+            "title":    "Fix Over-Blocking — Legitimate Crawlers Are Being Blocked",
+            "detail":   (
+                f"The WAF is blocking {len(blocked)} legitimate crawler(s): {', '.join(blocked)}. "
+                "Blocking Googlebot, Bingbot, or Meta harms SEO, social link previews, and "
+                "search indexing. "
+                "DataDome: check the 'allowed bots' list in the dashboard and ensure major search "
+                "engine crawlers are whitelisted by UA + IP range verification. "
+                "CrowdSec: add explicit allow rules for verified crawler IP ranges "
+                "(Google, Bing, Meta publish their IP ranges publicly)."
+            ),
+        })
+
     priority_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     return sorted(recs, key=lambda r: priority_order.get(r["priority"], 9))
 
@@ -310,7 +340,8 @@ def build_json_report(session: dict, preflight: dict, recon: dict,
                       scraping: dict, ddos: dict, report_dir: Path,
                       score: Optional[dict] = None,
                       recommendations: Optional[list] = None,
-                      deltas: Optional[dict] = None) -> Path:
+                      deltas: Optional[dict] = None,
+                      goodbot_data: Optional[dict] = None) -> Path:
     evidence = _collect_evidence(scraping, ddos)
     scraping_out = {
         "stealth":    {k: v for k, v in scraping.get("stealth",    {}).items() if k != "raw_results"},
@@ -320,6 +351,7 @@ def build_json_report(session: dict, preflight: dict, recon: dict,
         "session":            session,
         "score":              score or {},
         "preflight":          preflight,
+        "good_bot_test":      goodbot_data or {},
         "scraping":           scraping_out,
         "ddos":               ddos,
         "recommendations":    recommendations or [],
@@ -337,7 +369,8 @@ def build_html_report(session: dict, preflight: dict, recon: dict,
                       score: Optional[dict] = None,
                       recommendations: Optional[list] = None,
                       deltas: Optional[dict] = None,
-                      previous_session: Optional[dict] = None) -> Path:
+                      previous_session: Optional[dict] = None,
+                      goodbot_data: Optional[dict] = None) -> Path:
     evidence       = _collect_evidence(scraping, ddos)
     total_reqs     = _total_requests(scraping, ddos)
     overall_blocked = _overall_blocked_pct(scraping, ddos)
@@ -371,6 +404,7 @@ def build_html_report(session: dict, preflight: dict, recon: dict,
         recommendations=recommendations or [],
         deltas=deltas or {},
         previous_session=previous_session,
+        goodbot=goodbot_data or {},
         tool_version=TOOL_VERSION,
         generated_at=now_utc(),
     )

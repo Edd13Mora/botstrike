@@ -9,6 +9,31 @@ from rich.table import Table
 
 from .utils import console, log, now_utc, stealth_headers, get_proxy_dict
 
+FLOW_PATTERNS: dict[str, list[str]] = {
+    "login":          ["/login", "/signin", "/sign-in", "/auth/login", "/account/login", "/user/login", "/session/new"],
+    "signup":         ["/signup", "/register", "/sign-up", "/create-account", "/join", "/account/create", "/enroll"],
+    "password_reset": ["/forgot", "/reset", "/password-reset", "/recover", "/account/recover", "/lost-password"],
+    "checkout":       ["/checkout", "/cart", "/basket", "/bag", "/order/new", "/purchase"],
+    "sales":          ["/pricing", "/plans", "/buy", "/quote", "/request-demo", "/contact-sales"],
+    "api":            ["/api/", "/v1/", "/v2/", "/v3/", "/graphql", "/rest/", "/rpc/"],
+}
+
+
+def classify_flows(urls: list[str]) -> dict[str, list[str]]:
+    """
+    Classify discovered URLs into named attack-flow categories.
+    Returns only categories with at least one matching URL.
+    """
+    flows: dict[str, list[str]] = {k: [] for k in FLOW_PATTERNS}
+    for url in urls:
+        path = url.lower()
+        for flow_name, patterns in FLOW_PATTERNS.items():
+            if any(p in path for p in patterns):
+                flows[flow_name].append(url)
+                break
+    return {k: v for k, v in flows.items() if v}
+
+
 URL_CATEGORIES = {
     "product": ["/product", "/item", "/p/", "/detail", "/produit", "/artikel"],
     "category": ["/category", "/cat/", "/c/", "/collection", "/catalog", "/categorie"],
@@ -146,6 +171,8 @@ def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = N
         categorized[cat].append(url)
     result["url_categories"] = dict(categorized)
 
+    result["classified_flows"] = classify_flows(result["all_discovered_urls"])
+
     _print_recon_summary(result)
     return result
 
@@ -163,6 +190,13 @@ def _print_recon_summary(r: dict) -> None:
     cats = r.get("url_categories", {})
     for cat, urls in cats.items():
         table.add_row(f"  → {cat}", str(len(urls)))
+
+    flows = r.get("classified_flows", {})
+    if flows:
+        table.add_row("", "")
+        table.add_row("[bold cyan]Attack Flows Found[/bold cyan]", "")
+        for flow, urls in flows.items():
+            table.add_row(f"  ★ {flow}", str(len(urls)))
 
     console.print(table)
     console.print()

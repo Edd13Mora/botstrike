@@ -82,7 +82,7 @@ _check_deps()
 import yaml
 from rich.prompt import Confirm
 
-from modules import preflight, recon, scraper, ddos, reporter
+from modules import preflight, recon, scraper, ddos, reporter, goodbot
 from modules.utils import (
     console, log, print_banner, new_session_id, make_report_dir,
     setup_file_logger, now_utc, phase_banner, TOOL_VERSION,
@@ -92,6 +92,7 @@ from modules.utils import (
 
 _session_data: dict = {}
 _preflight_data: dict = {}
+_goodbot_data: dict = {}
 _recon_data: dict = {}
 _scraping_data: dict = {"stealth": {}, "aggressive": {}}
 _ddos_data: dict = {}
@@ -111,11 +112,13 @@ def _save_partial_and_exit(sig, frame) -> None:
         try:
             json_path = reporter.build_json_report(
                 _session_data, _preflight_data, _recon_data,
-                _scraping_data, _ddos_data, _report_dir
+                _scraping_data, _ddos_data, _report_dir,
+                goodbot_data=_goodbot_data,
             )
             html_path = reporter.build_html_report(
                 _session_data, _preflight_data, _recon_data,
-                _scraping_data, _ddos_data, _report_dir
+                _scraping_data, _ddos_data, _report_dir,
+                goodbot_data=_goodbot_data,
             )
             log_path = _report_dir / f"botstrike_{_session_data['id']}.log"
             reporter.print_final_summary(
@@ -516,10 +519,14 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
     Run the full pipeline on one target URL and return all collected data
     as a flat dict.  Used by both single-target and --compare modes.
     """
-    import json as _json
+    global _session_data, _preflight_data, _goodbot_data, _recon_data
+    global _scraping_data, _ddos_data, _report_dir, _logger
+
     session_id  = new_session_id()
     report_dir  = make_report_dir(target_url, session_id)
     logger      = setup_file_logger(report_dir, session_id)
+    _report_dir = report_dir
+    _logger     = logger
 
     effective_mode = args.mode
     if effective_mode in ("ddos", "full") and not args.confirm_authorized:
@@ -537,11 +544,13 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
         "authorized":   args.confirm_authorized,
         "interrupted":  False,
     }
+    _session_data = session_data
 
     log(f"[{label or target_url}] Session {session_id} started", "info", logger)
 
     phase_banner("MODULE 0: PRE-FLIGHT FINGERPRINTING")
     preflight_data = preflight.run(target_url, timeout=cfg["preflight"]["timeout"], logger=logger)
+    _preflight_data = preflight_data
 
     if not preflight_data.get("target_alive"):
         log(f"[{label}] Target unreachable — skipping.", "error", logger)
@@ -552,24 +561,38 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
             "score": {}, "recommendations": [], "report_dir": report_dir,
         }
 
+    goodbot_data = goodbot.run(target_url, cfg, logger)
+    _goodbot_data = goodbot_data
+
     phase_banner("MODULE 1: PASSIVE RECON")
     recon_data = recon.run(target_url, timeout=cfg["preflight"]["timeout"], logger=logger)
-    all_urls   = recon_data.get("all_discovered_urls", [target_url])
+    _recon_data = recon_data
+    all_urls         = recon_data.get("all_discovered_urls", [target_url])
+    classified_flows = recon_data.get("classified_flows", {})
+
+    if classified_flows:
+        flow_names = ", ".join(classified_flows.keys())
+        console.print(f"  [bold cyan]Attack flows found:[/bold cyan] {flow_names}")
 
     scraping_data: dict = {"stealth": {}, "aggressive": {}}
     if effective_mode in ("scrape", "full"):
         scraping_data["stealth"]    = scraper.run_stealth(target_url, all_urls, cfg["scraping"]["stealth"], logger)
         scraping_data["aggressive"] = scraper.run_aggressive(target_url, all_urls, cfg["scraping"]["aggressive"], logger)
+    _scraping_data = scraping_data
 
     ddos_data: dict = {}
     if effective_mode in ("ddos", "full") and args.confirm_authorized:
         phase_banner("MODULE 3: DDOS SIMULATION")
-        ddos_data = ddos.run(target_url, all_urls, cfg["ddos"], logger)
+        ddos_data = ddos.run(target_url, all_urls, cfg["ddos"],
+                             classified_flows=classified_flows, logger=logger)
+    _ddos_data = ddos_data
 
     session_data["end_time"] = now_utc()
 
-    score_data   = reporter.calculate_protection_score(preflight_data, scraping_data, ddos_data)
-    recs         = reporter.generate_recommendations(preflight_data, scraping_data, ddos_data, score_data)
+    score_data   = reporter.calculate_protection_score(preflight_data, scraping_data, ddos_data,
+                                                       goodbot_data=goodbot_data)
+    recs         = reporter.generate_recommendations(preflight_data, scraping_data, ddos_data,
+                                                     score_data, goodbot_data=goodbot_data)
     prev_report  = reporter.load_previous_report(target_url, session_id)
     deltas: dict = {}
 
@@ -586,11 +609,13 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
     json_path = reporter.build_json_report(
         session_data, preflight_data, recon_data, scraping_data, ddos_data,
         report_dir, score=score_data, recommendations=recs, deltas=deltas,
+        goodbot_data=goodbot_data,
     )
     html_path = reporter.build_html_report(
         session_data, preflight_data, recon_data, scraping_data, ddos_data,
         report_dir, score=score_data, recommendations=recs, deltas=deltas,
         previous_session=prev_report.get("session") if prev_report else None,
+        goodbot_data=goodbot_data,
     )
     log_path = report_dir / f"botstrike_{session_id}.log"
 
@@ -604,6 +629,7 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
     return {
         "session":         session_data,
         "preflight":       preflight_data,
+        "good_bot_test":   goodbot_data,
         "recon":           recon_data,
         "scraping":        scraping_data,
         "ddos":            ddos_data,
@@ -618,7 +644,7 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    global _session_data, _preflight_data, _recon_data, _scraping_data, _ddos_data
+    global _session_data, _preflight_data, _goodbot_data, _recon_data, _scraping_data, _ddos_data
     global _report_dir, _logger
 
     print_banner()

