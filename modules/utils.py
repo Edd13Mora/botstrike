@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 import random
@@ -36,6 +37,21 @@ def get_proxy_dict() -> Optional[dict]:
     if not _PROXY_URL:
         return None
     return {"http": _PROXY_URL, "https": _PROXY_URL}
+
+
+# ─── Basic auth config (module-level, set once at startup) ───────────────────
+
+_BASIC_AUTH: Optional[tuple[str, str]] = None
+
+
+def set_basic_auth(username: str, password: str) -> None:
+    global _BASIC_AUTH
+    _BASIC_AUTH = (username, password)
+
+
+def get_basic_auth() -> Optional[tuple[str, str]]:
+    """Return (username, password) tuple or None. Pass directly to requests auth=."""
+    return _BASIC_AUTH
 
 
 # ─── User-Agent pool ─────────────────────────────────────────────────────────
@@ -176,6 +192,11 @@ def stealth_headers(base_url: str = "") -> dict:
     ref = random.choice(REFERRERS)
     if ref:
         headers["Referer"] = ref
+
+    # Inject Basic Auth header if credentials were provided
+    if _BASIC_AUTH:
+        creds = base64.b64encode(f"{_BASIC_AUTH[0]}:{_BASIC_AUTH[1]}".encode()).decode()
+        headers["Authorization"] = f"Basic {creds}"
 
     # Shuffle header order to avoid fingerprinting on ordering
     items = list(headers.items())

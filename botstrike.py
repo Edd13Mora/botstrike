@@ -313,6 +313,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    # ── Authentication ──────────────────────────────────────────────────────
+    g_auth = p.add_argument_group("authentication")
+    g_auth.add_argument(
+        "--basic-auth",
+        default=None,
+        metavar="USER:PASS",
+        dest="basic_auth",
+        help=(
+            "HTTP Basic Auth credentials for sites protected by htaccess / staging auth.\n"
+            "Format: username:password\n"
+            "Applied to every request across all modules.\n"
+            "Example: --basic-auth staging:secret123"
+        ),
+    )
+
     # ── Output & metadata ───────────────────────────────────────────────────
     g_out = p.add_argument_group("output & metadata")
     g_out.add_argument(
@@ -709,6 +724,17 @@ def main() -> None:
         from modules.utils import set_proxy
         set_proxy(args.proxy)
         log(f"[PROXY] Routing via {args.proxy}", "info")
+
+    # ── Basic auth setup ──
+    if getattr(args, "basic_auth", None):
+        from modules.utils import set_basic_auth
+        raw = args.basic_auth
+        if ":" not in raw:
+            console.print("[red][!] --basic-auth must be in USER:PASS format[/red]")
+            sys.exit(1)
+        user, password = raw.split(":", 1)
+        set_basic_auth(user, password)
+        log(f"[AUTH] Basic auth set for user '{user}'", "info")
 
     # ── Profile info ──
     profile = getattr(args, "profile", "medium") or "medium"

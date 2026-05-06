@@ -12,7 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 from rich.table import Table
 
-from .utils import console, log, now_utc, stealth_headers, get_proxy_dict
+from .utils import console, log, now_utc, stealth_headers, get_proxy_dict, get_basic_auth
 
 # ── Flow classification ───────────────────────────────────────────────────────
 
@@ -587,6 +587,8 @@ def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = N
     session.headers.update(stealth_headers())
     if proxies:
         session.proxies.update(proxies)
+    if get_basic_auth():
+        session.auth = get_basic_auth()
 
     discovered: set[str] = set()
     all_js_urls: set[str] = set()
