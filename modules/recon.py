@@ -79,10 +79,10 @@ def _is_static(url: str) -> bool:
 
 # ── Deep HTML extraction ──────────────────────────────────────────────────────
 
-def _extract_from_html(html: str, base_url: str, base_host: str) -> tuple[list[str], list[str]]:
+def _extract_from_html(html: str, base_url: str, base_host: str) -> tuple[list[str], list[str], list[str]]:
     """
     Extract URLs from HTML more deeply than just <a href>.
-    Returns (page_urls, js_file_urls).
+    Returns (page_urls, js_file_urls, inline_js_paths).
 
     Sources:
       - <a href>
@@ -90,6 +90,7 @@ def _extract_from_html(html: str, base_url: str, base_host: str) -> tuple[list[s
       - data-href, data-url, data-action, data-src, data-endpoint
       - <script src>   (collected for JS parsing)
       - <link href>    (non-static)
+      - inline <script> content (parsed for API paths)
     """
     soup = BeautifulSoup(html, "lxml")
     page_urls: set[str] = set()
@@ -125,7 +126,7 @@ def _extract_from_html(html: str, base_url: str, base_host: str) -> tuple[list[s
             if val:
                 _add(val)
 
-    # <script src> — JS files to parse for hidden API paths
+    # <script src> — external JS files for parsing
     for tag in soup.find_all("script", src=True):
         src = tag["src"].strip()
         if src:
@@ -134,7 +135,15 @@ def _extract_from_html(html: str, base_url: str, base_host: str) -> tuple[list[s
             if p.scheme in ("http", "https") and full.split("?")[0].endswith(".js"):
                 js_urls.add(full)
 
-    return list(page_urls), list(js_urls)
+    # Inline <script> — parse content directly for API paths
+    inline_paths: set[str] = set()
+    for tag in soup.find_all("script", src=False):
+        content = tag.get_text()
+        if content and len(content) > 20:
+            for path in _extract_from_js(content, base_url):
+                inline_paths.add(path)
+
+    return list(page_urls), list(js_urls), list(inline_paths)
 
 
 # ── JavaScript parsing ────────────────────────────────────────────────────────
@@ -370,11 +379,16 @@ def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = N
     try:
         r = session.get(target_url, timeout=timeout)
         if r.status_code == 200:
-            page_urls, js_urls = _extract_from_html(r.text, target_url, base_host)
+            page_urls, js_urls, inline_paths = _extract_from_html(r.text, target_url, base_host)
             result["crawled_urls"] = page_urls
             discovered.update(page_urls)
             all_js_urls.update(js_urls)
-            log(f"  Homepage → {len(page_urls)} URLs, {len(js_urls)} JS files", "success", logger)
+            result["inline_js_paths"] = len(inline_paths)
+            # Probe inline-script paths to confirm they exist
+            if inline_paths:
+                inline_probed = _probe_paths(target_url, list(inline_paths), _PROBE_TIMEOUT, logger)
+                discovered.update(e["url"] for e in inline_probed)
+            log(f"  Homepage → {len(page_urls)} URLs, {len(js_urls)} JS files, {len(inline_paths)} inline paths", "success", logger)
     except Exception as e:
         log(f"  Homepage crawl error: {e}", "warning", logger)
 
@@ -450,6 +464,8 @@ def _print_recon_summary(r: dict) -> None:
     table.add_row("robots.txt disallowed",    str(len(r["disallowed_paths"])))
     table.add_row("sitemap.xml URLs",         str(len(r["sitemap_urls"])))
     table.add_row("Homepage links (deep HTML)", str(len(r["crawled_urls"])))
+    if r.get("inline_js_paths"):
+        table.add_row("Inline script paths", str(r["inline_js_paths"]))
     table.add_row("JS files → live endpoints", str(r.get("js_paths_extracted", 0)))
 
     live_g = r.get("guessed_paths_live", 0)

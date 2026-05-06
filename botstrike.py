@@ -82,7 +82,7 @@ _check_deps()
 import yaml
 from rich.prompt import Confirm
 
-from modules import preflight, recon, scraper, ddos, reporter, goodbot
+from modules import preflight, recon, scraper, ddos, reporter, goodbot, openapi as openapi_mod, endpoint_probe
 from modules.utils import (
     console, log, print_banner, new_session_id, make_report_dir,
     setup_file_logger, now_utc, phase_banner, TOOL_VERSION,
@@ -93,6 +93,8 @@ from modules.utils import (
 _session_data: dict = {}
 _preflight_data: dict = {}
 _goodbot_data: dict = {}
+_openapi_data: dict = {}
+_endpoint_data: dict = {}
 _recon_data: dict = {}
 _scraping_data: dict = {"stealth": {}, "aggressive": {}}
 _ddos_data: dict = {}
@@ -110,15 +112,21 @@ def _save_partial_and_exit(sig, frame) -> None:
         _session_data["end_time"] = now_utc()
         _session_data["interrupted"] = True
         try:
+            global _session_data, _preflight_data, _goodbot_data, _openapi_data, _endpoint_data
+            global _recon_data, _scraping_data, _ddos_data, _report_dir, _logger
             json_path = reporter.build_json_report(
                 _session_data, _preflight_data, _recon_data,
                 _scraping_data, _ddos_data, _report_dir,
                 goodbot_data=_goodbot_data,
+                openapi_data=_openapi_data,
+                endpoint_data=_endpoint_data,
             )
             html_path = reporter.build_html_report(
                 _session_data, _preflight_data, _recon_data,
                 _scraping_data, _ddos_data, _report_dir,
                 goodbot_data=_goodbot_data,
+                openapi_data=_openapi_data,
+                endpoint_data=_endpoint_data,
             )
             log_path = _report_dir / f"botstrike_{_session_data['id']}.log"
             reporter.print_final_summary(
@@ -519,8 +527,8 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
     Run the full pipeline on one target URL and return all collected data
     as a flat dict.  Used by both single-target and --compare modes.
     """
-    global _session_data, _preflight_data, _goodbot_data, _recon_data
-    global _scraping_data, _ddos_data, _report_dir, _logger
+    global _session_data, _preflight_data, _goodbot_data, _openapi_data, _endpoint_data
+    global _recon_data, _scraping_data, _ddos_data, _report_dir, _logger
 
     session_id  = new_session_id()
     report_dir  = make_report_dir(target_url, session_id)
@@ -564,15 +572,32 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
     goodbot_data = goodbot.run(target_url, cfg, logger)
     _goodbot_data = goodbot_data
 
+    openapi_data = openapi_mod.run(target_url, cfg, logger)
+    _openapi_data = openapi_data
+
     phase_banner("MODULE 1: PASSIVE RECON")
     recon_data = recon.run(target_url, timeout=cfg["preflight"]["timeout"], logger=logger)
     _recon_data = recon_data
     all_urls         = recon_data.get("all_discovered_urls", [target_url])
     classified_flows = recon_data.get("classified_flows", {})
 
+    # Add OpenAPI-discovered endpoint URLs to the attack pool
+    api_ep_urls = [ep["url"] for ep in openapi_data.get("swagger_endpoints", []) if ep.get("url")]
+    if api_ep_urls:
+        all_urls = list(set(all_urls + api_ep_urls))
+        classified_flows = recon.classify_flows(all_urls)
+        console.print(f"  [cyan]+ {len(api_ep_urls)} URLs from OpenAPI spec added to attack pool[/cyan]")
+
     if classified_flows:
         flow_names = ", ".join(classified_flows.keys())
         console.print(f"  [bold cyan]Attack flows found:[/bold cyan] {flow_names}")
+
+    endpoint_data = endpoint_probe.run(
+        target_url, classified_flows, cfg,
+        authorized=args.confirm_authorized,
+        logger=logger,
+    )
+    _endpoint_data = endpoint_data
 
     scraping_data: dict = {"stealth": {}, "aggressive": {}}
     if effective_mode in ("scrape", "full"):
@@ -590,9 +615,13 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
     session_data["end_time"] = now_utc()
 
     score_data   = reporter.calculate_protection_score(preflight_data, scraping_data, ddos_data,
-                                                       goodbot_data=goodbot_data)
+                                                       goodbot_data=goodbot_data,
+                                                       openapi_data=openapi_data,
+                                                       endpoint_data=endpoint_data)
     recs         = reporter.generate_recommendations(preflight_data, scraping_data, ddos_data,
-                                                     score_data, goodbot_data=goodbot_data)
+                                                     score_data, goodbot_data=goodbot_data,
+                                                     openapi_data=openapi_data,
+                                                     endpoint_data=endpoint_data)
     prev_report  = reporter.load_previous_report(target_url, session_id)
     deltas: dict = {}
 
@@ -610,12 +639,16 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
         session_data, preflight_data, recon_data, scraping_data, ddos_data,
         report_dir, score=score_data, recommendations=recs, deltas=deltas,
         goodbot_data=goodbot_data,
+        openapi_data=openapi_data,
+        endpoint_data=endpoint_data,
     )
     html_path = reporter.build_html_report(
         session_data, preflight_data, recon_data, scraping_data, ddos_data,
         report_dir, score=score_data, recommendations=recs, deltas=deltas,
         previous_session=prev_report.get("session") if prev_report else None,
         goodbot_data=goodbot_data,
+        openapi_data=openapi_data,
+        endpoint_data=endpoint_data,
     )
     log_path = report_dir / f"botstrike_{session_id}.log"
 
@@ -638,14 +671,16 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
         "report_dir":      report_dir,
         "json_path":       json_path,
         "html_path":       html_path,
+        "openapi":         openapi_data,
+        "endpoint_map":    endpoint_data,
     }
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    global _session_data, _preflight_data, _goodbot_data, _recon_data, _scraping_data, _ddos_data
-    global _report_dir, _logger
+    global _session_data, _preflight_data, _goodbot_data, _openapi_data, _endpoint_data
+    global _recon_data, _scraping_data, _ddos_data, _report_dir, _logger
 
     print_banner()
     args = parse_args()

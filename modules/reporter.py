@@ -14,7 +14,9 @@ BLOCK_CODES = {403, 406, 429, 503}
 # ─── Protection Score ─────────────────────────────────────────────────────────
 
 def calculate_protection_score(preflight: dict, scraping: dict, ddos: dict,
-                               goodbot_data: Optional[dict] = None) -> dict:
+                               goodbot_data: Optional[dict] = None,
+                               openapi_data: Optional[dict] = None,
+                               endpoint_data: Optional[dict] = None) -> dict:
     """
     Score the target's bot protection from 0-100 and convert to an A-F grade.
     Each finding deducts points; higher score = better protection.
@@ -98,6 +100,44 @@ def calculate_protection_score(preflight: dict, scraping: dict, ddos: dict,
         else:
             findings.append({"sev": "PASS", "msg": "All legitimate crawlers (Googlebot, Meta, etc.) are allowed"})
 
+    # ── OpenAPI / GraphQL exposure ──
+    if openapi_data:
+        if openapi_data.get("graphql_introspection_open"):
+            score -= 10
+            findings.append({"sev": "HIGH", "msg": "GraphQL introspection is open — full schema leaked"})
+        if openapi_data.get("swagger_found"):
+            findings.append({"sev": "INFO", "msg": f"OpenAPI spec publicly accessible at {openapi_data.get('swagger_url')}"})
+
+    # ── Per-endpoint findings ──
+    if endpoint_data:
+        shadow_bans = endpoint_data.get("shadow_bans", [])
+        cors_issues = endpoint_data.get("cors_issues", [])
+        timing      = endpoint_data.get("timing_attack", {})
+
+        if shadow_bans:
+            findings.append({"sev": "PASS", "msg": f"Shadow-ban active on {len(shadow_bans)} endpoint(s) — WAF silently degrading bot responses"})
+
+        for ep in cors_issues:
+            score -= 10
+            cors = ep.get("cors", {})
+            findings.append({
+                "sev": "HIGH",
+                "msg": f"CORS misconfiguration on {ep['url']} — wildcard={cors.get('wildcard')} credentials={cors.get('credentials_with_arbitrary_origin')}",
+            })
+
+        if timing.get("vulnerable"):
+            score -= 10
+            findings.append({"sev": "HIGH", "msg": f"Account enumeration via timing on login — {timing.get('diff_ms', 0):.0f}ms difference"})
+        elif timing.get("tested"):
+            findings.append({"sev": "PASS", "msg": "Login endpoint shows no timing difference (no account enumeration)"})
+
+        # Endpoints where bot UAs are not blocked
+        unprotected = [ep for ep in endpoint_data.get("endpoint_results", []) if not ep.get("bot_blocked")]
+        if unprotected:
+            score -= min(10, len(unprotected) * 3)
+            names = ", ".join(ep["flow"] for ep in unprotected[:3])
+            findings.append({"sev": "HIGH", "msg": f"Bot UAs not blocked on {len(unprotected)} endpoint(s): {names}"})
+
     score = max(0, score)
     if score >= 90:   grade = "A"
     elif score >= 80: grade = "B"
@@ -112,7 +152,9 @@ def calculate_protection_score(preflight: dict, scraping: dict, ddos: dict,
 
 def generate_recommendations(preflight: dict, scraping: dict, ddos: dict,
                               score_data: dict,
-                              goodbot_data: Optional[dict] = None) -> list[dict]:
+                              goodbot_data: Optional[dict] = None,
+                              openapi_data: Optional[dict] = None,
+                              endpoint_data: Optional[dict] = None) -> list[dict]:
     """
     Generate prioritised, actionable recommendations based on test findings.
     Tailored to DataDome and CrowdSec deployment context.
@@ -240,6 +282,86 @@ def generate_recommendations(preflight: dict, scraping: dict, ddos: dict,
             ),
         })
 
+    # ── OpenAPI / GraphQL ──
+    if openapi_data:
+        if openapi_data.get("graphql_introspection_open"):
+            recs.append({
+                "priority": "HIGH",
+                "title":    "Disable GraphQL Introspection in Production",
+                "detail":   (
+                    "GraphQL introspection is enabled, exposing your full API schema including "
+                    "all queries, mutations, types, and field names. This gives attackers a complete "
+                    "roadmap of your API surface. Disable introspection in your GraphQL server config "
+                    "for all non-development environments."
+                ),
+            })
+        if openapi_data.get("swagger_found"):
+            recs.append({
+                "priority": "MEDIUM",
+                "title":    "Restrict Access to API Documentation Endpoint",
+                "detail":   (
+                    f"The OpenAPI/Swagger spec is publicly accessible at {openapi_data.get('swagger_url')}. "
+                    "This reveals every endpoint, parameter, and data model. "
+                    "Restrict access to authenticated users or internal network only, "
+                    "or remove it from production entirely."
+                ),
+            })
+
+    # ── Per-endpoint ──
+    if endpoint_data:
+        if endpoint_data.get("timing_attack", {}).get("vulnerable"):
+            timing = endpoint_data["timing_attack"]
+            recs.append({
+                "priority": "HIGH",
+                "title":    "Fix Account Enumeration Timing Vulnerability on Login",
+                "detail":   (
+                    f"The login endpoint at {timing.get('url', '?')} responds "
+                    f"{timing.get('diff_ms', 0):.0f}ms faster for random emails than for common ones. "
+                    "This allows attackers to enumerate valid accounts. "
+                    "Ensure the login handler takes constant time regardless of whether the email exists "
+                    "(use a constant-time comparison or always run the password hash even for unknown emails)."
+                ),
+            })
+
+        for ep in endpoint_data.get("cors_issues", []):
+            cors = ep.get("cors", {})
+            recs.append({
+                "priority": "HIGH",
+                "title":    f"Fix CORS Misconfiguration on {ep.get('flow', '').title()} Endpoint",
+                "detail":   (
+                    f"Endpoint {ep['url']} returns Access-Control-Allow-Origin for arbitrary origins. "
+                    + ("Credentials are also allowed, making this exploitable for cross-origin data theft. " if cors.get("credentials_with_arbitrary_origin") else "")
+                    + "Restrict CORS to known trusted origins only."
+                ),
+            })
+
+        unprotected = [ep for ep in endpoint_data.get("endpoint_results", []) if not ep.get("bot_blocked")]
+        if unprotected:
+            urls = ", ".join(ep["url"] for ep in unprotected[:3])
+            recs.append({
+                "priority": "HIGH",
+                "title":    "Bot UAs Not Blocked on Sensitive Flow Endpoints",
+                "detail":   (
+                    f"{len(unprotected)} sensitive endpoint(s) allow obvious bot User-Agents (python-requests, curl, Scrapy): {urls}. "
+                    "These should be blocked immediately. "
+                    "DataDome: verify the JS tag is loading on these pages and enforcement mode is active. "
+                    "CrowdSec: confirm the http-bad-user-agents scenario is enabled."
+                ),
+            })
+
+        shadow_bans = endpoint_data.get("shadow_bans", [])
+        if shadow_bans:
+            recs.append({
+                "priority": "LOW",
+                "title":    "Shadow Ban Detected — Consider Transparency",
+                "detail":   (
+                    f"The WAF appears to be shadow-banning bots on {len(shadow_bans)} endpoint(s): "
+                    "returning HTTP 200 but with degraded/empty response bodies. "
+                    "This is a valid technique to confuse scrapers, but verify it does not "
+                    "accidentally affect legitimate users with unusual network configurations."
+                ),
+            })
+
     priority_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     return sorted(recs, key=lambda r: priority_order.get(r["priority"], 9))
 
@@ -341,7 +463,9 @@ def build_json_report(session: dict, preflight: dict, recon: dict,
                       score: Optional[dict] = None,
                       recommendations: Optional[list] = None,
                       deltas: Optional[dict] = None,
-                      goodbot_data: Optional[dict] = None) -> Path:
+                      goodbot_data: Optional[dict] = None,
+                      openapi_data: Optional[dict] = None,
+                      endpoint_data: Optional[dict] = None) -> Path:
     evidence = _collect_evidence(scraping, ddos)
     scraping_out = {
         "stealth":    {k: v for k, v in scraping.get("stealth",    {}).items() if k != "raw_results"},
@@ -357,6 +481,8 @@ def build_json_report(session: dict, preflight: dict, recon: dict,
         "recommendations":    recommendations or [],
         "detection_evidence": evidence,
         "deltas":             deltas or {},
+        "openapi":            openapi_data or {},
+        "endpoint_map":       endpoint_data or {},
     }
     sid      = session.get("id", "unknown")
     out_path = report_dir / f"botstrike_{sid}.json"
@@ -370,7 +496,9 @@ def build_html_report(session: dict, preflight: dict, recon: dict,
                       recommendations: Optional[list] = None,
                       deltas: Optional[dict] = None,
                       previous_session: Optional[dict] = None,
-                      goodbot_data: Optional[dict] = None) -> Path:
+                      goodbot_data: Optional[dict] = None,
+                      openapi_data: Optional[dict] = None,
+                      endpoint_data: Optional[dict] = None) -> Path:
     evidence       = _collect_evidence(scraping, ddos)
     total_reqs     = _total_requests(scraping, ddos)
     overall_blocked = _overall_blocked_pct(scraping, ddos)
@@ -405,6 +533,8 @@ def build_html_report(session: dict, preflight: dict, recon: dict,
         deltas=deltas or {},
         previous_session=previous_session,
         goodbot=goodbot_data or {},
+        openapi=openapi_data or {},
+        endpoint_map=endpoint_data or {},
         tool_version=TOOL_VERSION,
         generated_at=now_utc(),
     )
