@@ -312,41 +312,191 @@ def _probe_paths(base_url: str, paths: list[str], timeout: int,
 _KATANA_TIMEOUT = 120  # max seconds to wait for katana to finish
 
 
+def _detect_distro() -> str:
+    """Return lowercase distro ID from /etc/os-release, e.g. 'kali', 'ubuntu', 'debian'."""
+    try:
+        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+            if line.startswith("ID="):
+                return line.split("=", 1)[1].strip().strip('"').lower()
+    except Exception:
+        pass
+    return ""
+
+
+def _install_katana(logger: Optional[logging.Logger] = None) -> bool:
+    """
+    Auto-install katana using the best method available for this environment.
+
+    Priority:
+      1. apt          — Kali Linux (katana is in the official Kali repo)
+      2. go install   — any distro that has Go on PATH
+      3. Binary dl    — download prebuilt tarball/zip from GitHub releases
+
+    Returns True if katana is usable after the attempt, False otherwise.
+    On non-Linux systems, prints a hint and returns False immediately.
+    """
+    import json
+    import os
+    import platform
+    import tarfile
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    if platform.system() != "Linux":
+        console.print(
+            "  [dim]Katana not found. Install from projectdiscovery/katana "
+            "(go install or apt on Kali).[/dim]"
+        )
+        return False
+
+    distro  = _detect_distro()
+    machine = platform.machine().lower()
+    arch    = {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "386"}.get(machine, machine)
+
+    console.print(
+        f"  [cyan]Katana not found — auto-installing "
+        f"(distro=[bold]{distro or 'unknown'}[/bold], arch=[bold]{arch}[/bold])...[/cyan]"
+    )
+    log(f"  Katana not found — auto-install: distro={distro} arch={arch}", "info", logger)
+
+    # ── Method 1: apt (Kali only — katana is in the Kali repo) ───────────────
+    if distro == "kali" and shutil.which("apt"):
+        console.print("  [cyan]→[/cyan] Trying: sudo apt install -y katana")
+        try:
+            proc = subprocess.run(
+                ["sudo", "apt", "install", "-y", "katana"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if proc.returncode == 0 and shutil.which("katana"):
+                console.print("  [bold green]✓ Installed via apt[/bold green]")
+                log("  Katana installed via apt", "success", logger)
+                return True
+            log(f"  apt failed (rc={proc.returncode}): {proc.stderr[:300]}", "warning", logger)
+        except Exception as e:
+            log(f"  apt install error: {e}", "warning", logger)
+
+    # ── Method 2: go install (any distro with Go on PATH) ────────────────────
+    if shutil.which("go"):
+        console.print("  [cyan]→[/cyan] Trying: go install katana@latest")
+        try:
+            gopath_proc = subprocess.run(
+                ["go", "env", "GOPATH"],
+                capture_output=True, text=True, timeout=10,
+            )
+            gopath = gopath_proc.stdout.strip() or os.path.expanduser("~/go")
+            env = {**os.environ, "PATH": os.environ.get("PATH", "") + f":{gopath}/bin"}
+
+            proc = subprocess.run(
+                ["go", "install", "github.com/projectdiscovery/katana/cmd/katana@latest"],
+                capture_output=True, text=True, timeout=180, env=env,
+            )
+            if proc.returncode == 0:
+                os.environ["PATH"] = env["PATH"]
+                if shutil.which("katana"):
+                    console.print("  [bold green]✓ Installed via go install[/bold green]")
+                    log("  Katana installed via go install", "success", logger)
+                    return True
+            log(f"  go install failed (rc={proc.returncode}): {proc.stderr[:300]}", "warning", logger)
+        except Exception as e:
+            log(f"  go install error: {e}", "warning", logger)
+
+    # ── Method 3: prebuilt binary from GitHub releases ────────────────────────
+    console.print("  [cyan]→[/cyan] Trying: download prebuilt binary from GitHub releases")
+    try:
+        api_url = "https://api.github.com/repos/projectdiscovery/katana/releases/latest"
+        req = urllib.request.Request(api_url, headers={"User-Agent": "botstrike-installer/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            release = json.loads(resp.read())
+
+        # Prefer zip, fall back to tar.gz
+        asset_url  = None
+        asset_name = None
+        for ext in ("zip", "tar.gz"):
+            candidate = f"katana_linux_{arch}.{ext}"
+            for asset in release.get("assets", []):
+                if asset["name"] == candidate:
+                    asset_url  = asset["browser_download_url"]
+                    asset_name = asset["name"]
+                    break
+            if asset_url:
+                break
+
+        if not asset_url:
+            raise ValueError(f"No prebuilt binary for linux_{arch} in latest release")
+
+        install_dir = Path(os.path.expanduser("~/.local/bin"))
+        install_dir.mkdir(parents=True, exist_ok=True)
+
+        console.print(f"  [cyan]  Downloading {asset_name}...[/cyan]", end="", flush=True)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir) / asset_name
+            urllib.request.urlretrieve(asset_url, str(tmp_path))
+
+            if asset_name.endswith(".zip"):
+                with zipfile.ZipFile(tmp_path) as zf:
+                    zf.extractall(tmpdir)
+            else:
+                with tarfile.open(tmp_path, "r:gz") as tf:
+                    tf.extractall(tmpdir)
+
+            binary = Path(tmpdir) / "katana"
+            if not binary.exists():
+                raise FileNotFoundError("katana binary not found in archive")
+
+            import shutil as _sh
+            dest = install_dir / "katana"
+            _sh.copy2(str(binary), str(dest))
+            dest.chmod(0o755)
+
+        # Expose ~/.local/bin in this process's PATH
+        local_bin = str(install_dir)
+        if local_bin not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = os.environ.get("PATH", "") + f":{local_bin}"
+
+        if shutil.which("katana"):
+            console.print(f" [bold green]✓ Installed to {dest}[/bold green]")
+            log(f"  Katana installed via binary download → {dest}", "success", logger)
+            return True
+
+        raise RuntimeError("Binary placed but still not found on PATH")
+
+    except Exception as e:
+        log(f"  Binary download failed: {e}", "warning", logger)
+
+    console.print("  [yellow]Could not auto-install Katana — skipping.[/yellow]")
+    console.print(
+        "  [dim]Manual install: sudo apt install katana  (Kali)  "
+        "| go install github.com/projectdiscovery/katana/cmd/katana@latest[/dim]"
+    )
+    log("  Katana auto-install exhausted all methods — skipping", "warning", logger)
+    return False
+
+
 def _run_katana(target_url: str, base_host: str,
                 logger: Optional[logging.Logger] = None) -> list[str]:
     """
-    Run Katana (projectdiscovery/katana) if it is installed, and return
-    discovered URLs filtered to the same domain.
+    Ensure katana is installed, then run it and return discovered URLs
+    filtered to the same domain.
 
-    Flags used:
-      -d 3   crawl depth 3 levels deep
-      -jc    parse JavaScript files for additional endpoints
-      -ps    passive mode — pulls historical URLs from Wayback Machine + CommonCrawl
-      -silent  suppress all output except URLs (one per line to stdout)
-      -timeout 10  per-request timeout in seconds
-
-    Returns an empty list (silently) if katana is not on PATH or fails.
+    Flags:
+      -d 3     crawl 3 levels deep
+      -jc      parse JS files for additional endpoints
+      -ps      passive mode — Wayback Machine + CommonCrawl
+      -silent  URL-per-line stdout output
+      -timeout 10  per-request timeout (seconds)
     """
     if not shutil.which("katana"):
-        return []
+        if not _install_katana(logger):
+            return []
 
-    log("[RECON] Katana detected — running headless JS crawl + passive sources...", "info", logger)
+    log("[RECON] Katana — running headless JS crawl + passive sources...", "info", logger)
     console.print("  [bold cyan][katana][/bold cyan] Crawling (JS + passive)...", end="", flush=True)
 
     try:
         proc = subprocess.run(
-            [
-                "katana",
-                "-u", target_url,
-                "-d", "3",
-                "-jc",
-                "-ps",
-                "-silent",
-                "-timeout", "10",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_KATANA_TIMEOUT,
+            ["katana", "-u", target_url, "-d", "3", "-jc", "-ps", "-silent", "-timeout", "10"],
+            capture_output=True, text=True, timeout=_KATANA_TIMEOUT,
         )
         urls: list[str] = []
         for line in proc.stdout.splitlines():
@@ -358,14 +508,13 @@ def _run_katana(target_url: str, base_host: str,
         return urls
 
     except subprocess.TimeoutExpired:
-        console.print(f" [yellow]timed out after {_KATANA_TIMEOUT}s — using partial output[/yellow]")
+        console.print(f" [yellow]timed out after {_KATANA_TIMEOUT}s[/yellow]")
         log(f"  Katana timed out after {_KATANA_TIMEOUT}s", "warning", logger)
         return []
     except FileNotFoundError:
-        # katana disappeared between which() and run() — race condition, just skip
         return []
     except Exception as e:
-        console.print(f" [dim]skipped ({e})[/dim]")
+        console.print(f" [dim]error: {e}[/dim]")
         log(f"  Katana error: {e}", "warning", logger)
         return []
 
