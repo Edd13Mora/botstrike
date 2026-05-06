@@ -14,6 +14,14 @@ BotStrike is a command-line tool for security professionals. It attacks a websit
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Test Modules](#test-modules)
+  - [Module 0 — Pre-Flight Fingerprinting](#module-0--pre-flight-fingerprinting)
+  - [Module 0b — Good Bot Preservation Test](#module-0b--good-bot-preservation-test)
+  - [Module 0c — API Spec & GraphQL Discovery](#module-0c--api-spec--graphql-discovery)
+  - [Module 1 — Deep Recon & URL Discovery](#module-1--deep-recon--url-discovery)
+  - [Module 1b — Per-Endpoint Protection Map](#module-1b--per-endpoint-protection-map)
+  - [Module 2A — Stealth Scraping](#module-2a--stealth-scraping)
+  - [Module 2B — Aggressive Scraping](#module-2b--aggressive-scraping)
+  - [Module 3 — Application-Layer Bot Flood](#module-3--application-layer-bot-flood)
 - [CLI Reference](#cli-reference)
 - [Profile Presets](#profile-presets)
 - [Protection Scoring](#protection-scoring)
@@ -31,13 +39,16 @@ BotStrike is a command-line tool for security professionals. It attacks a websit
 
 ## How It Works
 
-BotStrike runs 4 phases against your target, one after another:
+BotStrike runs several phases against your target, one after another:
 
 ```
-Phase 0 · Pre-Flight      Checks what WAF / CDN is protecting the site
-Phase 1 · Recon           Reads robots.txt and sitemap to find pages to attack
-Phase 2 · Scraping        Sends stealth bots (human-like) then obvious bots
-Phase 3 · Bot Flood       4 attack types: HTTP flood, Slowloris, POST flood, Cache buster
+Phase 0  · Pre-Flight          Checks what WAF / CDN is protecting the site
+Phase 0b · Good Bot Test       Verifies Google, Meta, Bing are NOT being blocked
+Phase 0c · API Spec Discovery  Finds Swagger / OpenAPI docs and GraphQL endpoints
+Phase 1  · Deep Recon          Crawls HTML, parses JS files, fuzzes paths, probes wordlist
+Phase 1b · Endpoint Map        Tests each discovered flow endpoint individually
+Phase 2  · Scraping            Sends stealth bots (human-like) then obvious bots
+Phase 3  · Bot Flood           4 attack types: HTTP flood, Slowloris, POST flood, Cache buster
 ```
 
 After all phases finish, BotStrike:
@@ -131,14 +142,192 @@ If probes all get 200 → WAF is `PASSIVE (detection-only)` — a critical findi
 
 ---
 
-### Module 1 — Passive Recon
+### Module 0b — Good Bot Preservation Test
 
-Discovers pages to use in the scraping and flood phases.
+> **Why this matters:** Bot protection must block bad bots without hurting good ones. If Google, Meta, or Bing are getting blocked, the client is losing SEO visibility and social media previews. This is as bad as having no protection.
 
-- Reads `robots.txt` — extracts all Allow/Disallow paths
-- Reads `sitemap.xml` — extracts every `<loc>` URL (including nested sitemaps)
-- Crawls the homepage — extracts all `<a href>` links
-- Deduplicates everything and filters to the same domain
+Tests 9 legitimate crawlers that must **never** be blocked:
+
+| Bot | User-Agent |
+|---|---|
+| Googlebot | `Mozilla/5.0 (compatible; Googlebot/2.1; ...)` |
+| Google Image | `Googlebot-Image/1.0` |
+| Bingbot | `Mozilla/5.0 (compatible; bingbot/2.0; ...)` |
+| DuckDuckBot | `DuckDuckBot/1.0; ...` |
+| Applebot | `Mozilla/5.0 (compatible; Applebot/0.1; ...)` |
+| Meta / Facebook | `facebookexternalhit/1.1 ...` |
+| Twitterbot | `Twitterbot/1.0` |
+| LinkedInBot | `LinkedInBot/1.0 ...` |
+| Yahoo Slurp | `Mozilla/5.0 (compatible; Yahoo! Slurp; ...)` |
+
+A **sanity check** is also run: `python-requests/2.31.0` should be blocked — if it is not, the WAF is basically off.
+
+**Findings:**
+
+| Result | Meaning |
+|---|---|
+| Googlebot: BLOCKED | WAF is over-aggressive — SEO traffic at risk. HIGH finding. |
+| python-requests not blocked | WAF is barely active — basic bots slip through. CRITICAL finding. |
+| All good bots pass | WAF is correctly calibrated. |
+
+> **Note:** This test sends UA strings only — a fully strict WAF validates IP ownership via DNS reverse lookup in addition to the UA. This test checks the UA layer.
+
+---
+
+### Module 0c — API Spec & GraphQL Discovery
+
+Hunts for publicly exposed API documentation before the full crawl. Exposed specs massively expand the attack surface map.
+
+**Swagger / OpenAPI** — probes 28 well-known paths:
+
+```
+/swagger.json  /swagger/v1/swagger.json  /api-docs  /api-docs.json
+/openapi.json  /openapi.yaml  /v1/api-docs  /v2/api-docs  /docs
+/swagger-ui.html  /redoc  /api/redoc  /api/docs  /api/swagger ...
+```
+
+If a spec is found:
+- Parses both OpenAPI 2.x and 3.x formats
+- Extracts every endpoint: path, HTTP method, query params, request body fields
+- Adds all endpoint URLs into the main attack pool
+
+**GraphQL** — probes 8 common paths (`/graphql`, `/api/graphql`, `/graphiql`, `/query`, etc.) with an `__schema` introspection query:
+
+| Result | Meaning |
+|---|---|
+| Full schema returned | Introspection is **OPEN** — all operations/types/args leaked. HIGH finding. |
+| 400 with errors | Endpoint exists but introspection is disabled — good. |
+| No response | No GraphQL endpoint found. |
+
+If introspection is open, BotStrike extracts all query and mutation operation names.
+
+---
+
+### Module 1 — Deep Recon & URL Discovery
+
+Discovers every URL and endpoint on the site using 6 stacked methods:
+
+#### 1. robots.txt
+Reads all `Allow` and `Disallow` paths — often reveals admin paths, API prefixes, and staging areas the site owner doesn't want indexed.
+
+#### 2. Sitemap.xml
+Parses `<loc>` entries from all linked sitemaps (including nested `sitemap_index.xml`). Can surface thousands of product, category, and content URLs.
+
+#### 3. Deep HTML Extraction
+For each crawled page, extracts:
+- `<a href>` — all links
+- `<form action>` — form submission endpoints (login, search, checkout, etc.)
+- `data-href`, `data-url`, `data-action`, `data-endpoint`, `data-src`, `data-target`, `data-link`, `data-path` — JavaScript-driven endpoints embedded in HTML attributes
+- `<script src>` — external JS file URLs queued for parsing
+
+#### 4. JavaScript File Parsing
+Fetches up to 30 external `.js` files (skips bundles >5 MB) and extracts API paths using 9 regex patterns:
+
+| Pattern | What it finds |
+|---|---|
+| `fetch("/api/...")` | Fetch API calls |
+| `axios.get("/api/...")` | Axios HTTP calls |
+| `$.ajax({url: "..."})` | jQuery AJAX |
+| `XMLHttpRequest.open(...)` | Raw XHR |
+| Vue Router routes | `{ path: "/cart", ... }` |
+| React Router routes | `<Route path="/checkout" />` |
+| Angular routes | `{ path: 'login', component: ... }` |
+| API string literals | `"/api/v2/..."` in any context |
+| Inline `<script>` content | Same 9 patterns applied to inline scripts in HTML |
+
+#### 5. Wordlist Probing
+Probes ~350 guessed paths using 40 parallel HEAD threads. Keeps anything that returns a non-404/410 response. Paths are organized by category:
+
+- Authentication / Login / OAuth / SSO (40+ paths)
+- Registration / Signup (30+ paths)
+- Password Reset / Recovery (25+ paths)
+- Cart / Basket / Checkout / Payment (40+ paths)
+- Account / Profile / Dashboard (25+ paths)
+- Orders / Wishlist / Products / Search (40+ paths)
+- API endpoints (50+ paths, `/api/v1` through `/api/v4`, GraphQL, REST)
+- Admin / Backend / CMS (20+ paths)
+- Reviews / Contact / Support (20+ paths)
+- Sales / Pricing / B2B / Wholesale (20+ paths)
+- Discovery: `sitemap.xml`, `robots.txt`, `.well-known/security.txt`
+- Health: `/health`, `/actuator`, `/ping`, `/metrics`
+- International variants (French, German, Spanish, Dutch)
+
+#### 6. Path Fuzzing
+Takes every discovered API-style URL and generates variants:
+- **Version bumping:** `/api/v1/users` → `/api/v2/users`, `/api/v3/users`
+- **JSON suffix:** `/api/products` → `/api/products.json`
+- **Sub-resources:** `/api/orders` → `/api/orders/list`, `/api/orders/all`, `/api/orders/count`
+
+All fuzz candidates are HEAD-probed in parallel.
+
+#### Flow Classification
+
+Every discovered URL is classified into one of 6 attack flows:
+
+| Flow | Matches |
+|---|---|
+| `login` | `/login`, `/signin`, `/auth`, `/oauth`, `/sso` |
+| `signup` | `/register`, `/signup`, `/sign-up`, `/join`, `/enroll` |
+| `password_reset` | `/forgot`, `/reset`, `/password/reset`, `/recover` |
+| `checkout` | `/checkout`, `/payment`, `/cart`, `/billing`, `/punchout` |
+| `sales` | `/pricing`, `/plans`, `/quote`, `/demo`, `/b2b`, `/enterprise` |
+| `api` | `/api/`, `/graphql`, `/rest/`, `/v1/`, `/v2/` |
+
+Classified flows feed into the per-endpoint protection map and the flow-targeted bot flood.
+
+---
+
+### Module 1b — Per-Endpoint Protection Map
+
+After recon, BotStrike tests up to 3 URLs per flow for 5 specific vulnerabilities. This is where you find gaps that generic WAF scanning misses.
+
+#### Bot UA Detection Per Flow
+
+Sends each flow endpoint 3 known bad User-Agents:
+- `python-requests/2.31.0`
+- `curl/7.88.1`
+- `Go-http-client/1.1`
+
+If any return 200 (not blocked), that specific flow endpoint is unprotected — even if the WAF blocks them on the homepage.
+
+#### Shadow Ban Detection
+
+Sends a bot UA, gets 200 OK. Compares the response body size against a normal stealth request.
+
+If the bot gets a response that is >40% smaller (while the status code stays 200), the WAF is shadow-banning: silently serving degraded content to bots instead of blocking them. This is a PASS — the WAF is working — but clients should know it is happening.
+
+#### Rate Limit Threshold Finder
+
+Steps through RPS levels: 5 → 10 → 25 → 50 → 100 → 200.  
+At each level, sends a 2-second burst and counts block codes (403/429/503).  
+When >25% of requests are blocked, that is the rate limit threshold.
+
+> Only runs when `--confirm-authorized` is passed (it sends many requests).
+
+#### CORS Misconfiguration Check
+
+Tests each API endpoint with 3 crafted `Origin` headers:
+- `https://evil.com`
+- `null`
+- `https://attacker.example.org`
+
+If the response echoes back `Access-Control-Allow-Origin: https://evil.com` (or `*`) **and** `Access-Control-Allow-Credentials: true`, an attacker can steal authenticated API responses from any domain. HIGH finding.
+
+#### Login Timing Attack (Account Enumeration)
+
+Sends 6 POST requests to the login endpoint with random (definitely non-existent) email addresses, and 6 with common addresses (`admin@gmail.com`, `info@gmail.com`, etc.).
+
+If the average response time for common emails is >50ms slower than for random ones, the backend is doing a database lookup only for known accounts — this leaks whether an account exists. HIGH finding.
+
+**Per-endpoint output example:**
+```
+→ [login] https://shop.example.com/login
+   Stealth:200  BotUA:ALLOWED  RateLimit:~25 RPS  ShadowBan:no  CORS:ok
+
+→ [api] https://shop.example.com/api/v1/users
+   Stealth:200  BotUA:ALLOWED  RateLimit:not tested  ShadowBan:no  CORS:EXPOSED
+   CORS: wildcard=True creds=False
+```
 
 ---
 
@@ -154,8 +343,7 @@ Simulates a patient, human-like bot. This is the hardest type to detect because 
 - Waits 1.5–4 seconds between requests (configurable)
 - Uses a persistent session with cookies across requests
 
-For every HTML page it visits, it also tries to extract product data:
-- Name, price, description, images
+For every HTML page it visits, it also tries to extract product data: name, price, description, images.
 
 ---
 
@@ -176,13 +364,23 @@ Runs 4 attack vectors in sequence. A live terminal dashboard updates every 500ms
 > These are single-source L7 floods — they test per-IP rate limiting and detection speed. They are not the same as a distributed DDoS from a botnet. For client reports, describe this as "Application-Layer Bot Flood Stress Test."
 
 #### Vector 1 — HTTP Flood
-High-volume GET flood. Ramps from 0 to target RPS over 30 seconds, then sustains. Spreads across all discovered URLs.
+High-volume GET flood. Ramps from 0 to target RPS over 30 seconds, then sustains. Spreads across all discovered URLs — real crawled pages, not random paths.
 
 #### Vector 2 — Slowloris
 Opens many TCP connections (default 200) and keeps each one alive by sending incomplete requests — never finishing them. Goal: exhaust the server's connection pool without much bandwidth.
 
-#### Vector 3 — POST Flood
-Sends random POST data to form endpoints: `/checkout`, `/cart`, `/login`, `/search`, etc. POST requests are more expensive for the server to process than GETs.
+#### Vector 3 — Flow-Targeted POST Flood
+Sends realistic POST data to discovered flow endpoints, not random bytes. Each flow gets its own realistic payload:
+
+| Flow | POST data sent |
+|---|---|
+| Login | `{email, password}` |
+| Signup | `{email, username, password, confirm}` |
+| Password reset | `{email}` |
+| Checkout | `{card_number, expiry, cvv, amount, email}` |
+| Sales | `{name, email, company, message}` |
+
+If no flow URLs were discovered, falls back to keyword-matched paths from the wordlist.
 
 #### Vector 4 — Cache Buster
 Adds a unique query string (`?cb=<uuid>&ts=<ms>`) to every request so CDN caches cannot serve cached responses. Every request hits the origin server.
@@ -204,7 +402,7 @@ Adds a unique query string (`?cb=<uuid>&ts=<ms>`) to every request so CDN caches
 | Flag | Default | Description |
 |---|---|---|
 | `--mode MODE` | `full` | `scrape` — recon + scraping only. `ddos` — recon + flood only. `full` — everything. |
-| `--confirm-authorized` | off | Required to unlock the bot flood. Declares you have written authorization. |
+| `--confirm-authorized` | off | Required to unlock the bot flood and rate-limit scanning. Declares you have written authorization. |
 | `--yes` | off | Skip all confirmation prompts. For CI/scripted runs. |
 
 ### DDoS Tuning
@@ -275,8 +473,15 @@ BotStrike starts at 100 and subtracts points for each problem it finds:
 | Obvious bots blocked less than 50% of the time | −15 | HIGH |
 | Obvious bots blocked 50–79% of the time | −5 | LOW |
 | Each flood vector blocked less than 30% | −5 | MEDIUM |
+| Good bot over-blocked (Google/Meta/Bing blocked) | −15 | HIGH |
+| Bot UAs allowed on sensitive flow endpoints | −3 per (max −10) | HIGH |
+| CORS misconfiguration on API endpoint | −10 per endpoint | HIGH |
+| GraphQL introspection open (schema leak) | −10 | HIGH |
+| Login timing vulnerability (account enumeration) | −10 | HIGH |
 | No CDN detected | −5 | LOW |
 | HSTS header missing | −5 | LOW |
+
+**Shadow bans** (bot gets 200 OK but degraded content) score as a PASS — the WAF is working — but are noted in the report.
 
 **Grades:**
 
@@ -297,6 +502,22 @@ After scoring, BotStrike generates a prioritized list of things to fix. Each rec
 - Title
 - Detailed description with product-specific guidance for DataDome and CrowdSec
 
+**Recommendations generated include:**
+
+| Title | Severity |
+|---|---|
+| No Bot Protection Detected | CRITICAL |
+| WAF in Detection-Only Mode | HIGH |
+| Deploy a CDN | LOW |
+| Enable HSTS | LOW |
+| Good Bots Are Being Blocked (SEO/Social Risk) | HIGH |
+| Disable GraphQL Introspection in Production | HIGH |
+| Restrict Access to API Documentation Endpoint | MEDIUM |
+| Fix Account Enumeration Timing Vulnerability on Login | HIGH |
+| Fix CORS Misconfiguration on [Flow] Endpoint | HIGH |
+| Bot UAs Not Blocked on Sensitive Flow Endpoints | HIGH |
+| Shadow Ban Detected — Consider Transparency | LOW |
+
 Recommendations are sorted from most critical to least, and displayed as color-coded cards in the HTML report.
 
 ---
@@ -306,13 +527,16 @@ Recommendations are sorted from most critical to least, and displayed as color-c
 Reports are saved to `reports/<hostname>_<date>_<time>/` after every run.
 
 ### JSON Report (`botstrike_<id>.json`)
-Machine-readable full output. Contains every metric from every phase, the score, all recommendations, and historical deltas.
+Machine-readable full output. Contains every metric from every phase, the score, all recommendations, and historical deltas. Top-level keys include `openapi` and `endpoint_map` for the new discovery modules.
 
 ### HTML Report (`botstrike_<id>.html`)
 Standalone dark-themed dashboard — open it in any browser, no internet required. Sections:
 - Protection score hero (grade circle, numeric score, deductions)
 - Historical delta (▲/▼ vs your previous run on the same site)
 - WAF fingerprint results and probe table
+- Good bot preservation results
+- API spec / GraphQL discovery results
+- Per-endpoint protection map
 - Recommendations cards (color-coded by priority)
 - Scraping results with charts and extracted product samples
 - Bot flood results with latency percentiles and RPS charts
@@ -695,12 +919,16 @@ botstrike/
 ├── nodes.yaml.example        Template for your VPS fleet config
 ├── README.md
 ├── wordlists/
-│   └── useragents.txt        200+ real browser User-Agent strings
+│   ├── useragents.txt        200+ real browser User-Agent strings
+│   └── paths.txt             ~350 guessed paths organized by category
 ├── modules/
 │   ├── preflight.py          WAF/CDN detection + 8 attack probes
-│   ├── recon.py              robots.txt + sitemap + homepage crawler
+│   ├── goodbot.py            Good bot preservation test (Google, Meta, Bing, etc.)
+│   ├── openapi.py            Swagger/OpenAPI + GraphQL introspection discovery
+│   ├── recon.py              Deep recon: robots.txt, sitemap, HTML, JS, wordlist, fuzzing
+│   ├── endpoint_probe.py     Per-endpoint: shadow ban, CORS, timing attack, rate limit
 │   ├── scraper.py            Stealth + aggressive scraping
-│   ├── ddos.py               4-vector bot flood engine
+│   ├── ddos.py               4-vector flow-targeted bot flood engine
 │   ├── reporter.py           Scoring, recommendations, JSON + HTML reports
 │   ├── distributor.py        SSH orchestration for distributed fleet mode
 │   └── utils.py              Shared helpers: UA pool, headers, proxy, logging
