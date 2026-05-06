@@ -251,10 +251,69 @@ def _fuzz_paths(discovered_paths: list[str]) -> list[str]:
     return list(fuzzed - set(discovered_paths))
 
 
+def _fuzz_extensions(discovered_urls: list) -> list:
+    """
+    For every discovered URL that does NOT already have a file extension,
+    try appending common extensions and return new candidate paths.
+    Deduplicates; caps at 3000 candidates.
+    """
+    _EXTENSIONS = [
+        ".php", ".asp", ".aspx", ".jsp", ".html", ".htm",
+        ".bak", ".old", ".orig", ".backup", ".tmp", ".txt",
+        ".sql", ".json", ".xml",
+    ]
+
+    _HAS_EXT = re.compile(r'\.[a-zA-Z0-9]{1,10}$')
+
+    candidates: set = set()
+    for url in discovered_urls:
+        parsed = urlparse(url)
+        path   = parsed.path.rstrip("/")
+        if not path or _HAS_EXT.search(path):
+            continue
+        for ext in _EXTENSIONS:
+            candidates.add(path + ext)
+        if len(candidates) >= 3000:
+            break
+
+    return list(candidates)[:3000]
+
+
+def _fuzz_backups(discovered_urls: list) -> list:
+    """
+    For every discovered URL, generate backup/temp filename variants.
+    Returns new candidate paths (as paths, not full URLs).
+    Deduplicates; caps at 2000 candidates.
+    """
+    candidates: set = set()
+
+    for url in discovered_urls:
+        parsed   = urlparse(url)
+        path     = parsed.path.rstrip("/") or "/"
+        dirname  = path.rsplit("/", 1)[0] or "/"
+        filename = path.rsplit("/", 1)[-1]
+
+        # Suffixed variants of the full path
+        for suffix in (".bak", ".old", ".orig", "~", ".backup", ".bkp",
+                       "_backup", ".copy", ".save", ".swp"):
+            candidates.add(path + suffix)
+
+        # Directory-relative variants using the filename component
+        if filename:
+            candidates.add(f"{dirname}/{filename}.bak")
+            candidates.add(f"{dirname}/backup_{filename}")
+            candidates.add(f"{dirname}/{filename}_old")
+
+        if len(candidates) >= 2000:
+            break
+
+    return list(candidates)[:2000]
+
+
 # ── Parallel path prober ──────────────────────────────────────────────────────
 
 _PATHS_FILE    = Path(__file__).parent.parent / "wordlists" / "paths.txt"
-_PROBE_THREADS = 40
+_PROBE_THREADS = 150
 _PROBE_TIMEOUT = 5
 _DEAD_CODES    = {404, 410}
 
@@ -564,20 +623,24 @@ def _run_katana(target_url: str, base_host: str,
 
 def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = None) -> dict:
     result: dict = {
-        "robots_txt_content":    "",
-        "disallowed_paths":      [],
-        "allowed_paths":         [],
-        "sitemap_urls":          [],
-        "crawled_urls":          [],
-        "katana_urls":           0,
-        "js_paths_extracted":    0,
-        "guessed_paths_probed":  0,
-        "guessed_paths_live":    0,
-        "fuzzed_paths_probed":   0,
-        "fuzzed_paths_live":     0,
-        "url_categories":        {},
-        "all_discovered_urls":   [],
-        "classified_flows":      {},
+        "robots_txt_content":       "",
+        "disallowed_paths":         [],
+        "allowed_paths":            [],
+        "sitemap_urls":             [],
+        "crawled_urls":             [],
+        "katana_urls":              0,
+        "js_paths_extracted":       0,
+        "guessed_paths_probed":     0,
+        "guessed_paths_live":       0,
+        "fuzzed_paths_probed":      0,
+        "fuzzed_paths_live":        0,
+        "extension_paths_probed":   0,
+        "extension_paths_live":     0,
+        "backup_paths_probed":      0,
+        "backup_paths_live":        0,
+        "url_categories":           {},
+        "all_discovered_urls":      [],
+        "classified_flows":         {},
     }
 
     parsed_base = urlparse(target_url)
@@ -704,7 +767,33 @@ def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = N
         console.print(f" [bold green]{len(fuzz_live)} live[/bold green] / {len(fuzz_candidates)} fuzzed")
         log(f"  Fuzzing — {len(fuzz_live)} live / {len(fuzz_candidates)} tried", "success", logger)
 
-    # ── 7. Finalise ───────────────────────────────────────────────────────────
+    # ── 7. Extension fuzzing ──────────────────────────────────────────────────
+    ext_candidates = _fuzz_extensions(list(discovered))
+    if ext_candidates:
+        log(f"[RECON] Extension fuzzing {len(ext_candidates)} candidates...", "info", logger)
+        console.print(f"  [cyan]Extension fuzzing {len(ext_candidates)} candidates...[/cyan]", end="")
+        ext_probed = _probe_paths(target_url, ext_candidates, _PROBE_TIMEOUT, "extensions", logger)
+        ext_live   = [e["url"] for e in ext_probed]
+        discovered.update(ext_live)
+        result["extension_paths_probed"] = len(ext_candidates)
+        result["extension_paths_live"]   = len(ext_live)
+        console.print(f" [bold green]{len(ext_live)} live[/bold green] / {len(ext_candidates)} tried")
+        log(f"  Extension fuzzing — {len(ext_live)} live / {len(ext_candidates)} tried", "success", logger)
+
+    # ── 8. Backup file discovery ──────────────────────────────────────────────
+    bak_candidates = _fuzz_backups(list(discovered))
+    if bak_candidates:
+        log(f"[RECON] Backup fuzzing {len(bak_candidates)} candidates...", "info", logger)
+        console.print(f"  [cyan]Backup fuzzing {len(bak_candidates)} candidates...[/cyan]", end="")
+        bak_probed = _probe_paths(target_url, bak_candidates, _PROBE_TIMEOUT, "backups", logger)
+        bak_live   = [e["url"] for e in bak_probed]
+        discovered.update(bak_live)
+        result["backup_paths_probed"] = len(bak_candidates)
+        result["backup_paths_live"]   = len(bak_live)
+        console.print(f" [bold green]{len(bak_live)} live[/bold green] / {len(bak_candidates)} tried")
+        log(f"  Backup fuzzing — {len(bak_live)} live / {len(bak_candidates)} tried", "success", logger)
+
+    # ── 9. Finalise ───────────────────────────────────────────────────────────
     result["all_discovered_urls"] = list(discovered)
 
     categorized: dict[str, list] = defaultdict(list)
@@ -743,6 +832,16 @@ def _print_recon_summary(r: dict) -> None:
     tot_f  = r.get("fuzzed_paths_probed", 0)
     if tot_f:
         table.add_row(f"Fuzzed paths (live/{tot_f})", str(live_f))
+
+    live_e = r.get("extension_paths_live", 0)
+    tot_e  = r.get("extension_paths_probed", 0)
+    if tot_e:
+        table.add_row(f"Extension fuzz (live/{tot_e})", str(live_e))
+
+    live_b = r.get("backup_paths_live", 0)
+    tot_b  = r.get("backup_paths_probed", 0)
+    if tot_b:
+        table.add_row(f"Backup fuzz (live/{tot_b})", str(live_b))
 
     table.add_row("[bold]Total unique URLs[/bold]", f"[bold]{len(r['all_discovered_urls'])}[/bold]")
 

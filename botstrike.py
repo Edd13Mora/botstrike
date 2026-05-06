@@ -356,7 +356,7 @@ def parse_args() -> argparse.Namespace:
     g_preset = p.add_argument_group("behaviour presets")
     g_preset.add_argument(
         "--profile",
-        choices=["light", "medium", "heavy", "stealth"],
+        choices=["light", "medium", "heavy", "stealth", "nuclear"],
         default="medium",
         metavar="PROFILE",
         help=(
@@ -365,6 +365,7 @@ def parse_args() -> argparse.Namespace:
             "  medium   Balanced defaults — 60s vectors, 100 RPS  (default)\n"
             "  heavy    Sustained pressure — 120s vectors, 300 RPS, 20 threads\n"
             "  stealth  Maximum evasion — 1 thread, 5-12s delays, 10 RPS\n"
+            "  nuclear  Maximum aggression — 200 threads, all bot UAs, extension+backup fuzzing\n"
             "Useful shorthand: --profile heavy instead of specifying every flag."
         ),
     )
@@ -503,6 +504,13 @@ PROFILES: dict[str, dict] = {
         },
         "ddos": {"rps": 10, "duration": 30, "connections": 20, "ramp_up_seconds": 60, "pause_between_vectors": 15},
     },
+    "nuclear": {
+        "scraping": {
+            "stealth":    {"threads": 1, "delay_min": 0.0, "delay_max": 0.1, "max_pages": 50},
+            "aggressive": {"threads": 200, "max_pages": 9999},
+        },
+        "ddos": {"rps": 500, "duration": 180, "connections": 1000, "ramp_up_seconds": 20, "pause_between_vectors": 5},
+    },
 }
 
 
@@ -624,10 +632,14 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
     )
     _endpoint_data = endpoint_data
 
+    profile = getattr(args, "profile", "medium") or "medium"
+
     scraping_data: dict = {"stealth": {}, "aggressive": {}}
     if effective_mode in ("scrape", "full"):
         scraping_data["stealth"]    = scraper.run_stealth(target_url, all_urls, cfg["scraping"]["stealth"], logger)
         scraping_data["aggressive"] = scraper.run_aggressive(target_url, all_urls, cfg["scraping"]["aggressive"], logger)
+        if profile == "nuclear":
+            scraper.run_nuclear(target_url, all_urls, cfg["scraping"]["aggressive"], logger)
     _scraping_data = scraping_data
 
     ddos_data: dict = {}

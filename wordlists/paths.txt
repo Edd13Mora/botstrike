@@ -473,3 +473,167 @@
 /api/status
 /api/ping
 /api/ready
+
+# ── Sensitive / Config Files ──────────────────────────────────────────────────
+/.env
+/.env.local
+/.env.production
+/.env.backup
+/.env.example
+/web.config
+/app.config
+/config.php
+/config.js
+/config.json
+/database.yml
+/database.yaml
+/settings.py
+/settings.local.py
+/local_settings.py
+/application.properties
+/application.yml
+/appsettings.json
+/phpinfo.php
+/info.php
+/test.php
+/setup.php
+/install.php
+/install
+/wp-config.php
+/wp-config.php.bak
+/configuration.php
+/LocalSettings.php
+/config/database.php
+/config/app.php
+/config/secrets.yml
+
+# ── Git / VCS Exposure ────────────────────────────────────────────────────────
+/.git/config
+/.git/HEAD
+/.git/COMMIT_EDITMSG
+/.git/index
+/.git/logs/HEAD
+/.svn/entries
+/.svn/wc.db
+/.hg/store/00manifest.i
+/.bzr/branch-format
+
+# ── Backup / Archive Files ────────────────────────────────────────────────────
+/backup.zip
+/backup.tar.gz
+/backup.sql
+/db_backup.sql
+/database.sql
+/dump.sql
+/site.zip
+/www.zip
+/files.zip
+/backup/
+/backups/
+/old/
+/archive/
+/bak/
+/temp/
+/tmp/
+/uploads/backup/
+
+# ── CMS-Specific — WordPress ──────────────────────────────────────────────────
+/wp-json/wp/v2/users
+/wp-json/wp/v2/posts
+/wp-content/debug.log
+/wp-content/uploads/
+/wp-includes/
+/xmlrpc.php
+
+# ── CMS-Specific — Magento ────────────────────────────────────────────────────
+/rest/V1/store/storeViews
+/rest/V1/products
+/app/etc/local.xml
+/downloader/
+
+# ── CMS-Specific — PrestaShop ─────────────────────────────────────────────────
+/api/
+/api/products
+/config/settings.inc.php
+
+# ── CMS-Specific — Joomla ─────────────────────────────────────────────────────
+/administrator/
+/configuration.php
+/joomla.xml
+
+# ── CMS-Specific — Drupal ─────────────────────────────────────────────────────
+/user/login
+/user/register
+/admin/config
+/sites/default/settings.php
+
+# ── CMS-Specific — Shopify ────────────────────────────────────────────────────
+/admin/api/
+/apps/
+
+# ── CMS-Specific — OpenCart ───────────────────────────────────────────────────
+/system/config/
+
+# ── API / GraphQL Patterns ────────────────────────────────────────────────────
+/api/v4
+/api/v5
+/api/v6
+/api/v7
+/api/v8
+/api/v9
+/api/v10
+/api/internal
+/api/private
+/api/debug
+/api/test
+/api/dev
+/api/admin
+/api/superuser
+/api/export
+/api/import
+/api/bulk
+/api/webhook
+/api/webhooks
+/api/callbacks
+/v1/internal
+/v2/internal
+/graphql/console
+/graphql/playground
+
+# ── Framework / Debug — Laravel ───────────────────────────────────────────────
+/telescope
+/horizon
+/_debugbar
+/storage/logs/laravel.log
+
+# ── Framework / Debug — Django ────────────────────────────────────────────────
+/__debug__/
+/django-admin/
+/api/schema/
+/api/docs/
+
+# ── Framework / Debug — Spring Boot ──────────────────────────────────────────
+/actuator/env
+/actuator/beans
+/actuator/mappings
+/actuator/configprops
+/actuator/loggers
+/actuator/threaddump
+/actuator/heapdump
+/h2-console
+
+# ── Framework / Debug — Rails ─────────────────────────────────────────────────
+/rails/info/properties
+/rails/mailers
+
+# ── Framework / Debug — Node/Express ─────────────────────────────────────────
+/debug
+/console
+/.well-known/
+
+# ── Framework / Debug — PHP Admin Tools ───────────────────────────────────────
+/phpmyadmin/
+/pma/
+/phpmyadmin
+/mysql/
+/myadmin/
