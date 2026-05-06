@@ -54,6 +54,20 @@ def get_basic_auth() -> Optional[tuple[str, str]]:
     return _BASIC_AUTH
 
 
+# ─── Scan tag (client-visible identification header) ─────────────────────────
+
+_SCAN_TAG: Optional[str] = None
+
+
+def set_scan_tag(tag: str) -> None:
+    global _SCAN_TAG
+    _SCAN_TAG = tag.strip()
+
+
+def get_scan_tag() -> Optional[str]:
+    return _SCAN_TAG
+
+
 # ─── User-Agent pool ─────────────────────────────────────────────────────────
 
 _ua_pool: list[str] = []
@@ -198,6 +212,12 @@ def stealth_headers(base_url: str = "") -> dict:
         creds = base64.b64encode(f"{_BASIC_AUTH[0]}:{_BASIC_AUTH[1]}".encode()).decode()
         headers["Authorization"] = f"Basic {creds}"
 
+    # Always inject BotStrike identification so client can filter WAF dashboard
+    headers["X-BotStrike-Scan"] = "1"
+    headers["X-BotStrike-Version"] = TOOL_VERSION
+    if _SCAN_TAG:
+        headers["X-BotStrike-Tag"] = _SCAN_TAG
+
     # Shuffle header order to avoid fingerprinting on ordering
     items = list(headers.items())
     random.shuffle(items)
@@ -205,7 +225,14 @@ def stealth_headers(base_url: str = "") -> dict:
 
 
 def aggressive_headers() -> dict:
-    return {"User-Agent": "python-requests/2.31.0"}
+    h = {
+        "User-Agent": "python-requests/2.31.0",
+        "X-BotStrike-Scan": "1",
+        "X-BotStrike-Version": TOOL_VERSION,
+    }
+    if _SCAN_TAG:
+        h["X-BotStrike-Tag"] = _SCAN_TAG
+    return h
 
 
 # ─── Response classification ──────────────────────────────────────────────────

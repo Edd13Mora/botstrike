@@ -1,5 +1,8 @@
-import socket
 import logging
+import shutil
+import socket
+import subprocess
+import sys
 import threading
 from typing import Optional
 from urllib.parse import urlparse
@@ -327,6 +330,62 @@ def _detect_blocking_mode(responses: list[dict]) -> str:
     return "PASSIVE (detection-only)"
 
 
+def _run_wafw00f(target_url: str, timeout: int = 45,
+                 logger: Optional[logging.Logger] = None) -> dict:
+    """
+    Run wafw00f for authoritative WAF identification.
+    Auto-installs via pip if not found.
+    """
+    import re as _re
+    import subprocess as _sub
+    import sys as _sys
+
+    result: dict = {"waf_names": [], "detected": False, "raw": "", "error": None}
+
+    wafw00f_path = shutil.which("wafw00f")
+    if not wafw00f_path:
+        log("[wafw00f] not found — installing via pip...", "info", logger)
+        _sub.run(
+            [_sys.executable, "-m", "pip", "install", "wafw00f", "--quiet"],
+            capture_output=True, text=True, timeout=90,
+        )
+        wafw00f_path = shutil.which("wafw00f")
+
+    if not wafw00f_path:
+        result["error"] = "wafw00f install failed"
+        return result
+
+    try:
+        proc = _sub.run(
+            [wafw00f_path, target_url, "-a"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        output = (proc.stdout or "") + (proc.stderr or "")
+        result["raw"] = output[:1500]
+
+        for line in output.splitlines():
+            m = _re.search(
+                r"is behind ([^(\n]+?)(?:\s*\([^)]+\))?\s+WAF",
+                line, _re.IGNORECASE,
+            )
+            if m:
+                waf_name = m.group(1).strip()
+                if waf_name and waf_name not in result["waf_names"]:
+                    result["waf_names"].append(waf_name)
+                    result["detected"] = True
+
+        if "no waf detected" in output.lower():
+            result["detected"] = False
+            result["waf_names"] = []
+
+    except subprocess.TimeoutExpired:
+        result["error"] = f"timed out ({timeout}s)"
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
 # ─── Main entry point ─────────────────────────────────────────────────────────
 
 def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = None) -> dict:
@@ -394,6 +453,20 @@ def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = N
             result[key] = cr.status_code == 200
         except Exception:
             pass
+
+    # ── wafw00f dedicated fingerprinting ─────────────────────────────────────
+    log("[wafw00f] Running dedicated WAF fingerprinter...", "info", logger)
+    wafw00f_data = _run_wafw00f(target_url, timeout=min(timeout + 30, 60), logger=logger)
+    result["wafw00f"] = wafw00f_data
+    if wafw00f_data.get("detected"):
+        names = ", ".join(wafw00f_data["waf_names"])
+        log(f"  [wafw00f] Detected: {names}", "success", logger)
+        console.print(f"  [bold green][wafw00f][/bold green] Detected: [cyan]{names}[/cyan]")
+    elif wafw00f_data.get("error"):
+        log(f"  [wafw00f] {wafw00f_data['error']}", "warning", logger)
+    else:
+        console.print("  [dim][wafw00f] No WAF identified by dedicated fingerprinter[/dim]")
+    console.print()
 
     total = len(WAF_PROBES)
     log(f"[PREFLIGHT] Running {total} WAF probe requests ({_PROBE_WORKERS} parallel)...", "info", logger)
@@ -502,6 +575,17 @@ def _print_preflight_summary(r: dict) -> None:
         f"[{color}]{waf}[/{color}]{reason}",
         r.get("waf_notes", ""),
     )
+
+    wafw00f = r.get("wafw00f", {})
+    if wafw00f.get("detected"):
+        wafw00f_str = ", ".join(wafw00f["waf_names"])
+        table.add_row("wafw00f Fingerprint", f"[bold green]{wafw00f_str}[/bold green]",
+                      "Dedicated WAF fingerprinter")
+    elif wafw00f.get("error"):
+        table.add_row("wafw00f Fingerprint", f"[dim]{wafw00f['error']}[/dim]", "")
+    else:
+        table.add_row("wafw00f Fingerprint", "[dim]None detected[/dim]",
+                      "Dedicated WAF fingerprinter")
 
     mode  = r["blocking_mode"]
     mcolor = "green" if "ACTIVE" in mode else "red"

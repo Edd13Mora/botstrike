@@ -69,13 +69,20 @@ def _check_deps() -> None:
         print(f"  [{icon}] {pkg:<22} {status}")
 
     # ── External tools ────────────────────────────────────────────────────────
+    EXTERNAL_TOOLS = [
+        ("katana",   "active JS crawler            — auto-installs on first recon"),
+        ("httpx",    "HTTP probing + tech detection — auto-installs on first recon"),
+        ("nuclei",   "template vulnerability scan  — auto-installs on first scan"),
+        ("wafw00f",  "WAF fingerprinting           — pip install wafw00f"),
+    ]
     print()
     print("  External tools:")
-    katana_path = shutil.which("katana")
-    if katana_path:
-        print(f"  [✔] katana                 found ({katana_path})")
-    else:
-        print("  [i] katana                 not found — will auto-install on first recon")
+    for bin_name, description in EXTERNAL_TOOLS:
+        tool_path = shutil.which(bin_name)
+        if tool_path:
+            print(f"  [✔] {bin_name:<12} found ({tool_path})")
+        else:
+            print(f"  [i] {bin_name:<12} not found — {description}")
     print()
 
     if failed:
@@ -93,10 +100,10 @@ _check_deps()
 import yaml
 from rich.prompt import Confirm
 
-from modules import preflight, recon, scraper, ddos, reporter, goodbot, openapi as openapi_mod, endpoint_probe
+from modules import preflight, recon, scraper, ddos, reporter, goodbot, openapi as openapi_mod, endpoint_probe, nuclei_scan
 from modules.utils import (
     console, log, print_banner, new_session_id, make_report_dir,
-    setup_file_logger, now_utc, phase_banner, TOOL_VERSION,
+    setup_file_logger, now_utc, phase_banner, TOOL_VERSION, set_scan_tag,
 )
 
 # ─── Globals for graceful CTRL+C ─────────────────────────────────────────────
@@ -325,6 +332,17 @@ def parse_args() -> argparse.Namespace:
             "Format: username:password\n"
             "Applied to every request across all modules.\n"
             "Example: --basic-auth staging:secret123"
+        ),
+    )
+    g_auth.add_argument(
+        "--tag",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "Scan tag injected as X-BotStrike-Tag header into every request.\n"
+            "Allows the client to filter their WAF/CDN dashboard logs to see\n"
+            "only BotStrike traffic without looking at IP.\n"
+            "Example: --tag \"acme-audit-may2026\""
         ),
     )
 
@@ -611,6 +629,9 @@ def run_one_target(target_url: str, args: argparse.Namespace, cfg: dict,
     phase_banner("MODULE 1: PASSIVE RECON")
     recon_data = recon.run(target_url, timeout=cfg["preflight"]["timeout"], logger=logger)
     _recon_data = recon_data
+
+    nuclei_data = nuclei_scan.run(target_url, logger)
+
     all_urls         = recon_data.get("all_discovered_urls", [target_url])
     classified_flows = recon_data.get("classified_flows", {})
 
@@ -783,6 +804,12 @@ def main() -> None:
             except Exception as e:
                 console.print(f"[yellow]Could not verify (network error: {e})[/yellow]")
                 log(f"[AUTH] Could not verify credentials: {e}", "warning")
+
+    # ── Scan tag setup ──
+    if getattr(args, "tag", None):
+        set_scan_tag(args.tag)
+        console.print(f"  [cyan]Scan tag:[/cyan] [bold]X-BotStrike-Tag: {args.tag}[/bold]  [dim](visible in WAF/CDN dashboard)[/dim]\n")
+        log(f"[TAG] Scan tag set: X-BotStrike-Tag: {args.tag}", "info")
 
     # ── Profile info ──
     profile = getattr(args, "profile", "medium") or "medium"

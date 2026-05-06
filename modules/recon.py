@@ -590,12 +590,12 @@ def _run_katana(target_url: str, base_host: str,
         if not _install_katana(logger):
             return []
 
-    log("[RECON] Katana — running headless JS crawl + passive sources...", "info", logger)
-    console.print("  [bold cyan][katana][/bold cyan] Crawling (JS + passive)...", end="")
+    log("[RECON] Katana — running headless JS crawl...", "info", logger)
+    console.print("  [bold cyan][katana][/bold cyan] Active JS crawl (3 levels deep)...", end="")
 
     try:
         proc = subprocess.run(
-            ["katana", "-u", target_url, "-d", "3", "-jc", "-ps", "-silent", "-timeout", "10"],
+            ["katana", "-u", target_url, "-d", "3", "-jc", "-silent", "-timeout", "10"],
             capture_output=True, text=True, timeout=_KATANA_TIMEOUT,
         )
         urls: list[str] = []
@@ -617,6 +617,181 @@ def _run_katana(target_url: str, base_host: str,
         console.print(f" [dim]error: {e}[/dim]")
         log(f"  Katana error: {e}", "warning", logger)
         return []
+
+
+def _download_github_binary(repo: str, binary_name: str,
+                             logger: Optional[logging.Logger] = None) -> Optional[str]:
+    """
+    Download latest release binary for a GitHub repo (Linux only).
+    repo: "owner/name"  binary_name: executable to extract (e.g. "httpx")
+    Returns installed binary path or None.
+    """
+    import json as _json
+    import os
+    import platform
+    import tarfile
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    if platform.system() != "Linux":
+        return None
+
+    machine = platform.machine().lower()
+    arch = {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "386"}.get(machine, machine)
+
+    try:
+        api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+        req = urllib.request.Request(api_url, headers={"User-Agent": "botstrike-installer/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            release = _json.loads(resp.read())
+
+        all_assets = release.get("assets", [])
+        asset_url = asset_name = None
+
+        for ext in (".zip", ".tar.gz"):
+            for asset in all_assets:
+                name = asset["name"]
+                if (f"linux_{arch}" in name and name.endswith(ext)
+                        and "checksums" not in name and "sbom" not in name):
+                    asset_url = asset["browser_download_url"]
+                    asset_name = name
+                    break
+            if asset_url:
+                break
+
+        if not asset_url:
+            log(f"  [{binary_name}] No prebuilt binary for linux_{arch}", "warning", logger)
+            return None
+
+        install_dir = Path(os.path.expanduser("~/.local/bin"))
+        install_dir.mkdir(parents=True, exist_ok=True)
+
+        console.print(f"  [cyan]  Downloading {asset_name}...[/cyan]", end="")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir) / asset_name
+            urllib.request.urlretrieve(asset_url, str(tmp_path))
+
+            if asset_name.endswith(".zip"):
+                import zipfile as _zf
+                with _zf.ZipFile(tmp_path) as zf:
+                    zf.extractall(tmpdir)
+            else:
+                import tarfile as _tf
+                with _tf.open(tmp_path, "r:gz") as tf:
+                    tf.extractall(tmpdir)
+
+            binary = Path(tmpdir) / binary_name
+            if not binary.exists():
+                for candidate in Path(tmpdir).rglob(binary_name):
+                    binary = candidate
+                    break
+
+            if not binary.exists():
+                log(f"  [{binary_name}] binary not in archive", "warning", logger)
+                console.print(" [yellow]not found in archive[/yellow]")
+                return None
+
+            import shutil as _sh
+            dest = install_dir / binary_name
+            _sh.copy2(str(binary), str(dest))
+            dest.chmod(0o755)
+
+        path_str = str(install_dir)
+        if path_str not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = os.environ.get("PATH", "") + f":{path_str}"
+
+        result_path = shutil.which(binary_name) or (str(dest) if dest.exists() else None)
+        if result_path:
+            console.print(" [bold green]done[/bold green]")
+        else:
+            console.print(" [yellow]installed but not in PATH[/yellow]")
+        return result_path
+
+    except Exception as e:
+        log(f"  [{binary_name}] install failed: {e}", "warning", logger)
+        console.print(" [yellow]failed[/yellow]")
+        return None
+
+
+
+def _run_httpx(urls: list[str], logger: Optional[logging.Logger] = None) -> dict:
+    """
+    Fast HTTP probing with technology detection.
+    Returns {"tech_stack": [sorted list], "url_data": {url: {status, title, tech}}}.
+    """
+    import json as _json
+    import os
+    import tempfile
+
+    httpx_path = shutil.which("httpx")
+    if not httpx_path:
+        log("[httpx] not found — auto-installing...", "info", logger)
+        console.print("  [cyan][httpx] auto-installing...[/cyan]")
+        httpx_path = _download_github_binary("projectdiscovery/httpx", "httpx", logger)
+        if not httpx_path:
+            log("[httpx] could not be installed — skipping tech detection", "warning", logger)
+            return {"tech_stack": [], "url_data": {}}
+
+    if not urls:
+        return {"tech_stack": [], "url_data": {}}
+
+    probe_urls = list(dict.fromkeys(urls))[:500]
+    log(f"[httpx] Probing {len(probe_urls)} URLs for status + tech stack...", "info", logger)
+    console.print(f"  [cyan][httpx] Probing {len(probe_urls)} URLs...[/cyan]")
+
+    tmpfile = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False,
+                                         encoding="utf-8") as f:
+            f.write("\n".join(probe_urls))
+            tmpfile = f.name
+
+        proc = subprocess.run(
+            [httpx_path, "-l", tmpfile, "-silent", "-json",
+             "-tech-detect", "-status-code", "-title",
+             "-rate-limit", "50", "-timeout", "10"],
+            capture_output=True, text=True, timeout=180,
+        )
+
+        url_data: dict = {}
+        all_techs: set[str] = set()
+
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = _json.loads(line)
+                url = item.get("url", "")
+                techs = item.get("tech", [])
+                url_data[url] = {
+                    "status_code": item.get("status-code", 0),
+                    "title":       item.get("title", ""),
+                    "tech":        techs,
+                }
+                all_techs.update(techs)
+            except _json.JSONDecodeError:
+                continue
+
+        tech_list = sorted(all_techs)
+        log(f"  [httpx] {len(url_data)} URLs probed | {len(tech_list)} technologies: "
+            f"{', '.join(tech_list[:10])}", "success", logger)
+        console.print(f"  [green][httpx] Tech stack:[/green] {', '.join(tech_list[:12]) or 'none detected'}")
+        return {"tech_stack": tech_list, "url_data": url_data}
+
+    except subprocess.TimeoutExpired:
+        log("[httpx] timed out", "warning", logger)
+        return {"tech_stack": [], "url_data": {}}
+    except Exception as e:
+        log(f"[httpx] error: {e}", "warning", logger)
+        return {"tech_stack": [], "url_data": {}}
+    finally:
+        if tmpfile:
+            try:
+                os.unlink(tmpfile)
+            except Exception:
+                pass
 
 
 # ── Main recon runner ─────────────────────────────────────────────────────────
@@ -661,6 +836,12 @@ def run(target_url: str, timeout: int = 10, logger: Optional[logging.Logger] = N
     if katana_urls:
         discovered.update(katana_urls)
         result["katana_urls"] = len(katana_urls)
+    result["katana_urls_found"] = len(katana_urls)
+
+    # Step 0b: httpx — fast probing + tech detection on all discovered URLs so far
+    httpx_data = _run_httpx(list(discovered)[:500], logger)
+    result["httpx_tech_stack"] = httpx_data["tech_stack"]
+    result["httpx_url_data"]   = httpx_data["url_data"]
 
     # ── 1. robots.txt ─────────────────────────────────────────────────────────
     log("[RECON] Fetching robots.txt...", "info", logger)
@@ -813,50 +994,52 @@ def _print_recon_summary(r: dict) -> None:
     table = Table(title="Recon Summary", show_header=True, header_style="bold cyan")
     table.add_column("Source",  style="bold white", width=32)
     table.add_column("Count",   justify="right")
+    table.add_column("Notes",   style="dim", width=38)
 
     if r.get("katana_urls"):
-        table.add_row("[bold cyan]Katana (JS + passive)[/bold cyan]", f"[bold cyan]{r['katana_urls']}[/bold cyan]")
-    table.add_row("robots.txt disallowed",    str(len(r["disallowed_paths"])))
-    table.add_row("sitemap.xml URLs",         str(len(r["sitemap_urls"])))
-    table.add_row("Homepage links (deep HTML)", str(len(r["crawled_urls"])))
+        table.add_row("[bold cyan]Katana (active JS crawl)[/bold cyan]", f"[bold cyan]{r['katana_urls']}[/bold cyan]", "Live site — JS + deep link extraction")
+    table.add_row("httpx tech stack", ", ".join(r.get("httpx_tech_stack", [])) or "—", "Detected technologies")
+    table.add_row("robots.txt disallowed",    str(len(r["disallowed_paths"])), "")
+    table.add_row("sitemap.xml URLs",         str(len(r["sitemap_urls"])), "")
+    table.add_row("Homepage links (deep HTML)", str(len(r["crawled_urls"])), "")
     if r.get("inline_js_paths"):
-        table.add_row("Inline script paths", str(r["inline_js_paths"]))
-    table.add_row("JS files → live endpoints", str(r.get("js_paths_extracted", 0)))
+        table.add_row("Inline script paths", str(r["inline_js_paths"]), "")
+    table.add_row("JS files → live endpoints", str(r.get("js_paths_extracted", 0)), "")
 
     live_g = r.get("guessed_paths_live", 0)
     tot_g  = r.get("guessed_paths_probed", 0)
     if tot_g:
-        table.add_row(f"Wordlist paths (live/{tot_g})", str(live_g))
+        table.add_row(f"Wordlist paths (live/{tot_g})", str(live_g), "")
 
     live_f = r.get("fuzzed_paths_live", 0)
     tot_f  = r.get("fuzzed_paths_probed", 0)
     if tot_f:
-        table.add_row(f"Fuzzed paths (live/{tot_f})", str(live_f))
+        table.add_row(f"Fuzzed paths (live/{tot_f})", str(live_f), "")
 
     live_e = r.get("extension_paths_live", 0)
     tot_e  = r.get("extension_paths_probed", 0)
     if tot_e:
-        table.add_row(f"Extension fuzz (live/{tot_e})", str(live_e))
+        table.add_row(f"Extension fuzz (live/{tot_e})", str(live_e), "")
 
     live_b = r.get("backup_paths_live", 0)
     tot_b  = r.get("backup_paths_probed", 0)
     if tot_b:
-        table.add_row(f"Backup fuzz (live/{tot_b})", str(live_b))
+        table.add_row(f"Backup fuzz (live/{tot_b})", str(live_b), "")
 
-    table.add_row("[bold]Total unique URLs[/bold]", f"[bold]{len(r['all_discovered_urls'])}[/bold]")
+    table.add_row("[bold]Total unique URLs[/bold]", f"[bold]{len(r['all_discovered_urls'])}[/bold]", "")
 
     cats = r.get("url_categories", {})
     if cats:
-        table.add_row("", "")
+        table.add_row("", "", "")
         for cat, urls in cats.items():
-            table.add_row(f"  → {cat}", str(len(urls)))
+            table.add_row(f"  → {cat}", str(len(urls)), "")
 
     flows = r.get("classified_flows", {})
     if flows:
-        table.add_row("", "")
-        table.add_row("[bold cyan]Attack Flows Identified[/bold cyan]", "")
+        table.add_row("", "", "")
+        table.add_row("[bold cyan]Attack Flows Identified[/bold cyan]", "", "")
         for flow, urls in flows.items():
-            table.add_row(f"  ★ {flow}", str(len(urls)))
+            table.add_row(f"  ★ {flow}", str(len(urls)), "")
 
     console.print(table)
     console.print()
